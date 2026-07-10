@@ -40,10 +40,10 @@ class KimiStatus
 {
     public string Status = "offline";
     public int TokensToday;
-    public double? FiveHourPct;
-    public int? FiveHourResetMin;
-    public double? SevenDayPct;
-    public int? SevenDayResetMin;
+    public double? FiveHourPct = null;
+    public int? FiveHourResetMin = null;
+    public double? SevenDayPct = null;
+    public int? SevenDayResetMin = null;
     public bool NeedsInput;
 }
 
