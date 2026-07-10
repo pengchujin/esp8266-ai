@@ -1,6 +1,6 @@
-// ESP8266 WiFi clock: shows local time plus live Claude Code / Codex CLI
-// working status and usage quota, polled from a small bridge service that
-// runs on the developer's Mac (see ../bridge/bridge.py).
+// ESP8266 WiFi clock: shows local time plus live Claude Code / Codex CLI /
+// kimi-code working status and usage quota, polled from a small bridge service
+// that runs on the developer's Mac or PC (see ../mac-app/ and ../windows-app/).
 //
 // Display: 240x240 SPI ST7789 (TFT_eSPI). Pin mapping is set via build_flags
 // in platformio.ini - edit those if your wiring differs.
@@ -29,15 +29,15 @@ ESP8266WebServer webServer(80);
 
 // ---------- custom sprite storage (LittleFS) ----------
 // Custom uploads replace the compiled-in default animation without needing a
-// firmware rebuild. You POST a raw .gif straight to /sprite/claude or
-// /sprite/codex (the device serves its own upload page at "/"); the ESP8266
-// decodes and rescales the GIF *on-device* (AnimatedGIF, line-by-line so it
-// never needs a full-canvas buffer) into the wire format below, which the
-// display path then reads back frame-by-frame:
+// firmware rebuild. You POST a raw .gif straight to /sprite/claude,
+// /sprite/codex or /sprite/kimi (the device serves its own upload page at "/");
+// the ESP8266 decodes and rescales the GIF *on-device* (AnimatedGIF,
+// line-by-line so it never needs a full-canvas buffer) into the wire format
+// below, which the display path then reads back frame-by-frame:
 //   [1 byte frame count][frame0 bytes][frame1 bytes]...
-// Each frame is exactly CLAUDE_SPRITE_W x H (or CODEX_SPRITE_W x H) RGB565
-// pixels, byte order matching tools/convert_sprites.py's to_rgb565() so the
-// compiled-in defaults and custom uploads share one draw path.
+// Each frame is exactly <APP>_SPRITE_W x H RGB565 pixels, byte order matching
+// tools/convert_sprites.py's to_rgb565() so the compiled-in defaults and custom
+// uploads share one draw path.
 const char *CLAUDE_SPRITE_FILE = "/c.bin";
 const char *CODEX_SPRITE_FILE = "/x.bin";
 const char *KIMI_SPRITE_FILE = "/k.bin";
@@ -59,11 +59,34 @@ uint16_t prevRowBuf[SCREEN_W]; // decode only: same row from the previous frame
 
 bool claudeCustom = false;
 int claudeCustomFrames = 0;
+int claudeFrame = 0;
 bool codexCustom = false;
 int codexCustomFrames = 0;
+int codexFrame = 0;
 bool kimiCustom = false;
 int kimiCustomFrames = 0;
+int kimiFrame = 0;
 uint32_t spriteRev = 0; // bumped on upload/reset so the Mac mirror re-fetches
+
+// Centralized metadata for each character slot: custom flags, file paths,
+// compiled-in defaults and logo. Used to dispatch sprite upload/raw/reset and
+// drawing without repeating the same Claude/Codex/Kimi switch everywhere.
+struct SpriteSlot {
+  bool *custom;
+  int *customFrames;
+  int *frame;
+  const char *spriteFile;
+  const char *gifFile;
+  int defaultFrames;
+  int w, h;
+  const uint16_t *const *progmemFrames;
+  const uint16_t *logo;
+  int logoW, logoH;
+  SpriteSlot(bool *c, int *cf, int *fr, const char *sf, const char *gf, int df, int w_, int h_,
+             const uint16_t *const *pf, const uint16_t *lg, int lw, int lh)
+      : custom(c), customFrames(cf), frame(fr), spriteFile(sf), gifFile(gf), defaultFrames(df),
+        w(w_), h(h_), progmemFrames(pf), logo(lg), logoW(lw), logoH(lh) {}
+};
 
 const int SCREEN_CX = 120, SCREEN_CY = 120;
 const int RING_MARGIN = 4;      // inset from screen edge
@@ -76,6 +99,25 @@ const unsigned long SWITCH_IDLE_MS = 6000;   // neither working: alternate slow
 enum ActiveApp { APP_CLAUDE, APP_CODEX, APP_KIMI };
 ActiveApp currentApp = APP_CLAUDE;
 unsigned long lastSwitchMs = 0;
+
+// Look up the SpriteSlot metadata for a given app. Defined after the enum so
+// the compiler knows ActiveApp's values.
+SpriteSlot spriteSlot(ActiveApp app) {
+  switch (app) {
+    case APP_CLAUDE:
+      return SpriteSlot(&claudeCustom, &claudeCustomFrames, &claudeFrame, CLAUDE_SPRITE_FILE,
+                        CLAUDE_GIF_FILE, CLAUDE_SPRITE_FRAMES, CLAUDE_SPRITE_W, CLAUDE_SPRITE_H,
+                        claude_sprite_frames, claude_logo_0, CLAUDE_LOGO_W, CLAUDE_LOGO_H);
+    case APP_CODEX:
+      return SpriteSlot(&codexCustom, &codexCustomFrames, &codexFrame, CODEX_SPRITE_FILE,
+                        CODEX_GIF_FILE, CODEX_SPRITE_FRAMES, CODEX_SPRITE_W, CODEX_SPRITE_H,
+                        codex_sprite_frames, codex_logo_0, CODEX_LOGO_W, CODEX_LOGO_H);
+    default:
+      return SpriteSlot(&kimiCustom, &kimiCustomFrames, &kimiFrame, KIMI_SPRITE_FILE,
+                        KIMI_GIF_FILE, KIMI_SPRITE_FRAMES, KIMI_SPRITE_W, KIMI_SPRITE_H,
+                        kimi_sprite_frames, kimi_logo_0, KIMI_LOGO_W, KIMI_LOGO_H);
+  }
+}
 
 // Display override, settable from the Mac app via POST /api/display:
 // auto = follow working status, claude/codex = pin that app on screen,
@@ -131,9 +173,6 @@ bool musicHasArtwork = false;
 bool musicChromeDrawn = false;
 unsigned long lastMusicPollMs = 0;
 
-int claudeFrame = 0;
-int codexFrame = 0;
-int kimiFrame = 0;
 unsigned long lastAnimMs = 0;
 
 bool flashOn = true;
@@ -198,50 +237,29 @@ void saveBridgeHost(const String &host) {
 
 // ---------- custom sprite loading ----------
 
-// Checks LittleFS for a previously-uploaded custom sprite and validates its
-// size before trusting it (frame count byte + exact expected byte length).
+// Validates one custom sprite file: its size must exactly match
+// [1 byte frame count][count * frameBytes]. Returns the frame count via outCnt.
+static bool validateCustomSprite(const char *path, size_t frameBytes, int &outCnt) {
+  if (!LittleFS.exists(path)) return false;
+  File f = LittleFS.open(path, "r");
+  if (!f || f.size() < 1) {
+    if (f) f.close();
+    return false;
+  }
+  uint8_t cnt = f.read();
+  size_t expected = 1 + (size_t)cnt * frameBytes;
+  bool ok = cnt > 0 && cnt <= MAX_CUSTOM_FRAMES && (size_t)f.size() == expected;
+  f.close();
+  if (ok) outCnt = cnt;
+  return ok;
+}
+
+// Checks LittleFS for previously-uploaded custom sprites and validates their
+// sizes before trusting them.
 void loadCustomSpriteState() {
-  claudeCustom = false;
-  if (LittleFS.exists(CLAUDE_SPRITE_FILE)) {
-    File f = LittleFS.open(CLAUDE_SPRITE_FILE, "r");
-    if (f && f.size() >= 1) {
-      uint8_t cnt = f.read();
-      size_t expected = 1 + (size_t)cnt * CLAUDE_FRAME_BYTES;
-      if (cnt > 0 && cnt <= MAX_CUSTOM_FRAMES && (size_t)f.size() == expected) {
-        claudeCustom = true;
-        claudeCustomFrames = cnt;
-      }
-    }
-    if (f) f.close();
-  }
-
-  codexCustom = false;
-  if (LittleFS.exists(CODEX_SPRITE_FILE)) {
-    File f = LittleFS.open(CODEX_SPRITE_FILE, "r");
-    if (f && f.size() >= 1) {
-      uint8_t cnt = f.read();
-      size_t expected = 1 + (size_t)cnt * CODEX_FRAME_BYTES;
-      if (cnt > 0 && cnt <= MAX_CUSTOM_FRAMES && (size_t)f.size() == expected) {
-        codexCustom = true;
-        codexCustomFrames = cnt;
-      }
-    }
-    if (f) f.close();
-  }
-
-  kimiCustom = false;
-  if (LittleFS.exists(KIMI_SPRITE_FILE)) {
-    File f = LittleFS.open(KIMI_SPRITE_FILE, "r");
-    if (f && f.size() >= 1) {
-      uint8_t cnt = f.read();
-      size_t expected = 1 + (size_t)cnt * KIMI_FRAME_BYTES;
-      if (cnt > 0 && cnt <= MAX_CUSTOM_FRAMES && (size_t)f.size() == expected) {
-        kimiCustom = true;
-        kimiCustomFrames = cnt;
-      }
-    }
-    if (f) f.close();
-  }
+  claudeCustom = validateCustomSprite(CLAUDE_SPRITE_FILE, CLAUDE_FRAME_BYTES, claudeCustomFrames);
+  codexCustom = validateCustomSprite(CODEX_SPRITE_FILE, CODEX_FRAME_BYTES, codexCustomFrames);
+  kimiCustom = validateCustomSprite(KIMI_SPRITE_FILE, KIMI_FRAME_BYTES, kimiCustomFrames);
 
   Serial.printf("[sprite] claude custom=%d frames=%d | codex custom=%d frames=%d | kimi custom=%d frames=%d\n",
                 claudeCustom, claudeCustomFrames, codexCustom, codexCustomFrames, kimiCustom, kimiCustomFrames);
@@ -408,24 +426,10 @@ void drawQuotaText(float hourPct, float weekPct) {
 const int LOGO_X = 14, LOGO_Y = 18;
 
 void drawAppLogo() {
-  const uint16_t *logo;
-  int w, h;
-  if (currentApp == APP_CLAUDE) {
-    logo = claude_logo_0;
-    w = CLAUDE_LOGO_W;
-    h = CLAUDE_LOGO_H;
-  } else if (currentApp == APP_CODEX) {
-    logo = codex_logo_0;
-    w = CODEX_LOGO_W;
-    h = CODEX_LOGO_H;
-  } else {
-    logo = kimi_logo_0;
-    w = KIMI_LOGO_W;
-    h = KIMI_LOGO_H;
-  }
-  for (int r = 0; r < h; r++) {
-    memcpy_P(rowBuf, logo + (size_t)r * w, (size_t)w * 2);
-    tft.pushImage(LOGO_X, LOGO_Y + r, w, 1, rowBuf);
+  SpriteSlot s = spriteSlot(currentApp);
+  for (int r = 0; r < s.logoH; r++) {
+    memcpy_P(rowBuf, s.logo + (size_t)r * s.logoW, (size_t)s.logoW * 2);
+    tft.pushImage(LOGO_X, LOGO_Y + r, s.logoW, 1, rowBuf);
   }
 }
 
@@ -472,8 +476,8 @@ void redrawRingOnly() {
 // Who gets the screen:
 //   - display mode pinned (Mac app) -> that app, always
 //   - exactly one app working       -> that app, immediately
-//   - both working                  -> alternate every SWITCH_BOTH_MS (2s)
-//   - neither working               -> alternate slowly (SWITCH_IDLE_MS)
+//   - multiple apps working         -> alternate every SWITCH_BOTH_MS (2s)
+//   - none working                  -> alternate slowly (SWITCH_IDLE_MS)
 static ActiveApp nextAppInCycle(ActiveApp app) {
   return (app == APP_CLAUDE) ? APP_CODEX : (app == APP_CODEX) ? APP_KIMI : APP_CLAUDE;
 }
@@ -1186,51 +1190,33 @@ void handleApiBridge() {
 // as the custom .bin: [1 byte frame count][RGB565 frames...]. Lets the Mac
 // app mirror exactly what the device is showing (custom upload or built-in).
 void handleSpriteRaw(ActiveApp slot) {
-  bool custom;
-  const char *binPath;
-  int frames, w, h;
-  const uint16_t *const *arr;
-  if (slot == APP_CLAUDE) {
-    custom = claudeCustom; binPath = CLAUDE_SPRITE_FILE;
-    frames = CLAUDE_SPRITE_FRAMES; w = CLAUDE_SPRITE_W; h = CLAUDE_SPRITE_H; arr = claude_sprite_frames;
-  } else if (slot == APP_CODEX) {
-    custom = codexCustom; binPath = CODEX_SPRITE_FILE;
-    frames = CODEX_SPRITE_FRAMES; w = CODEX_SPRITE_W; h = CODEX_SPRITE_H; arr = codex_sprite_frames;
-  } else {
-    custom = kimiCustom; binPath = KIMI_SPRITE_FILE;
-    frames = KIMI_SPRITE_FRAMES; w = KIMI_SPRITE_W; h = KIMI_SPRITE_H; arr = kimi_sprite_frames;
-  }
-  if (custom) {
-    File f = LittleFS.open(binPath, "r");
+  SpriteSlot s = spriteSlot(slot);
+  if (*s.custom) {
+    File f = LittleFS.open(s.spriteFile, "r");
     if (f) {
       webServer.streamFile(f, "application/octet-stream");
       f.close();
       return;
     }
   }
-  size_t frameBytes = (size_t)w * h * 2;
-  webServer.setContentLength(1 + (size_t)frames * frameBytes);
+  size_t frameBytes = (size_t)s.w * s.h * 2;
+  webServer.setContentLength(1 + (size_t)s.defaultFrames * frameBytes);
   webServer.send(200, "application/octet-stream", "");
-  uint8_t cnt = (uint8_t)frames;
+  uint8_t cnt = (uint8_t)s.defaultFrames;
   webServer.sendContent((const char *)&cnt, 1);
-  for (int i = 0; i < frames; i++) {
-    webServer.sendContent_P((PGM_P)arr[i], frameBytes);
+  for (int i = 0; i < s.defaultFrames; i++) {
+    webServer.sendContent_P((PGM_P)s.progmemFrames[i], frameBytes);
     yield();
   }
 }
 
 // Removes a custom sprite so the compiled-in default animation comes back.
 void handleSpriteReset(ActiveApp slot) {
-  const char *binPath;
-  if (slot == APP_CLAUDE) binPath = CLAUDE_SPRITE_FILE;
-  else if (slot == APP_CODEX) binPath = CODEX_SPRITE_FILE;
-  else binPath = KIMI_SPRITE_FILE;
-  LittleFS.remove(binPath);
+  SpriteSlot s = spriteSlot(slot);
+  LittleFS.remove(s.spriteFile);
   spriteRev++;
   loadCustomSpriteState();
-  if (slot == APP_CLAUDE) claudeFrame = 0;
-  else if (slot == APP_CODEX) codexFrame = 0;
-  else kimiFrame = 0;
+  *s.frame = 0;
   if (currentApp == slot) drawActiveApp();
   webServer.send(200, "text/plain", "ok");
 }
@@ -1446,25 +1432,14 @@ void handleSpriteUploadChunk(const char *gifPath) {
 }
 
 void handleSpriteUploadDone(ActiveApp slot) {
-  const char *gifPath;
-  const char *binPath;
-  int tw, th;
-  if (slot == APP_CLAUDE) {
-    gifPath = CLAUDE_GIF_FILE; binPath = CLAUDE_SPRITE_FILE; tw = CLAUDE_SPRITE_W; th = CLAUDE_SPRITE_H;
-  } else if (slot == APP_CODEX) {
-    gifPath = CODEX_GIF_FILE; binPath = CODEX_SPRITE_FILE; tw = CODEX_SPRITE_W; th = CODEX_SPRITE_H;
-  } else {
-    gifPath = KIMI_GIF_FILE; binPath = KIMI_SPRITE_FILE; tw = KIMI_SPRITE_W; th = KIMI_SPRITE_H;
-  }
+  SpriteSlot s = spriteSlot(slot);
 
-  bool ok = decodeGifToBin(gifPath, binPath, tw, th);
-  LittleFS.remove(gifPath); // temp raw gif no longer needed once decoded
+  bool ok = decodeGifToBin(s.gifFile, s.spriteFile, s.w, s.h);
+  LittleFS.remove(s.gifFile); // temp raw gif no longer needed once decoded
 
   spriteRev++;
   loadCustomSpriteState();
-  if (slot == APP_CLAUDE) claudeFrame = 0;
-  else if (slot == APP_CODEX) codexFrame = 0;
-  else kimiFrame = 0;
+  *s.frame = 0;
   if (currentApp == slot) drawActiveApp();
 
   if (ok) {
@@ -1483,21 +1458,22 @@ void setupWebServer() {
   webServer.on("/api/info", HTTP_GET, handleApiInfo);
   webServer.on("/api/display", HTTP_POST, handleApiDisplay);
   webServer.on("/api/bridge", HTTP_POST, handleApiBridge);
-  webServer.on("/sprite/claude/reset", HTTP_POST, []() { handleSpriteReset(APP_CLAUDE); });
-  webServer.on("/sprite/codex/reset", HTTP_POST, []() { handleSpriteReset(APP_CODEX); });
-  webServer.on("/sprite/kimi/reset", HTTP_POST, []() { handleSpriteReset(APP_KIMI); });
-  webServer.on("/sprite/claude/raw", HTTP_GET, []() { handleSpriteRaw(APP_CLAUDE); });
-  webServer.on("/sprite/codex/raw", HTTP_GET, []() { handleSpriteRaw(APP_CODEX); });
-  webServer.on("/sprite/kimi/raw", HTTP_GET, []() { handleSpriteRaw(APP_KIMI); });
-  webServer.on(
-      "/sprite/claude", HTTP_POST, []() { handleSpriteUploadDone(APP_CLAUDE); },
-      []() { handleSpriteUploadChunk(CLAUDE_GIF_FILE); });
-  webServer.on(
-      "/sprite/codex", HTTP_POST, []() { handleSpriteUploadDone(APP_CODEX); },
-      []() { handleSpriteUploadChunk(CODEX_GIF_FILE); });
-  webServer.on(
-      "/sprite/kimi", HTTP_POST, []() { handleSpriteUploadDone(APP_KIMI); },
-      []() { handleSpriteUploadChunk(KIMI_GIF_FILE); });
+  // Register /sprite/<app>/{reset,raw} and /sprite/<app> upload routes for
+  // each supported character slot.
+  auto registerSpriteRoutes = [](ActiveApp app, const char *gifPath) {
+    const char *name = (app == APP_CLAUDE) ? "claude" : (app == APP_CODEX) ? "codex" : "kimi";
+    String base = "/sprite/";
+    base += name;
+    webServer.on(base + "/reset", HTTP_POST, [app]() { handleSpriteReset(app); });
+    webServer.on(base + "/raw", HTTP_GET, [app]() { handleSpriteRaw(app); });
+    webServer.on(
+        base, HTTP_POST, [app]() { handleSpriteUploadDone(app); },
+        [gifPath]() { handleSpriteUploadChunk(gifPath); });
+  };
+  registerSpriteRoutes(APP_CLAUDE, CLAUDE_GIF_FILE);
+  registerSpriteRoutes(APP_CODEX, CODEX_GIF_FILE);
+  registerSpriteRoutes(APP_KIMI, KIMI_GIF_FILE);
+
   webServer.begin();
   Serial.printf("[web] admin server listening on http://%s/\n", WiFi.localIP().toString().c_str());
 }

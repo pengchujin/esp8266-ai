@@ -162,6 +162,15 @@ sealed class TrayAppContext : ApplicationContext
         return $"{min}m";
     }
 
+    static string AppDisplayName(DeviceInfo info)
+    {
+        if (info.Mode == "net") return "网速";
+        if (info.Mode == "music") return "音乐";
+        return info.Showing == "claude" ? "Claude"
+            : info.Showing == "kimi" ? "Kimi"
+            : "Codex";
+    }
+
     async Task RefreshDeviceSection()
     {
         var host = DeviceClient.Host;
@@ -197,11 +206,8 @@ sealed class TrayAppContext : ApplicationContext
             info.CodexCustomSprite ? "X:自定义" : "X:默认",
             info.KimiCustomSprite ? "K:自定义" : "K:默认",
         };
-        var showing = info.Mode == "net" ? "网速"
-            : info.Mode == "music" ? "音乐"
-            : (info.Showing == "claude" ? "Claude" : info.Showing == "kimi" ? "Kimi" : "Codex");
         _deviceInfoItem.Text =
-            $"设备：{info.Ip} · 正在显示 {showing} · {string.Join(" ", sprites)}";
+            $"设备：{info.Ip} · 正在显示 {AppDisplayName(info)} · {string.Join(" ", sprites)}";
         foreach (var (mode, item) in _modeItems) item.Checked = mode == info.Mode;
     }
 

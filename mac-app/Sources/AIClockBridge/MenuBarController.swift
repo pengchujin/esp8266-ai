@@ -159,6 +159,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         return "\(min)m"
     }
 
+    private static func appDisplayName(info: DeviceInfo) -> String {
+        if info.mode == "net" { return "网速" }
+        if info.mode == "music" { return "音乐" }
+        return info.showing == "claude" ? "Claude"
+            : info.showing == "kimi" ? "Kimi"
+            : "Codex"
+    }
+
     private func refreshDeviceSection() {
         let host = DeviceClient.host
         guard !host.isEmpty else {
@@ -174,11 +182,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 let sprites = [info.claudeCustomSprite ? "C:自定义" : "C:默认",
                                info.codexCustomSprite ? "X:自定义" : "X:默认",
                                info.kimiCustomSprite ? "K:自定义" : "K:默认"]
-                let showing = info.mode == "net" ? "网速"
-                    : info.mode == "music" ? "音乐"
-                    : (info.showing == "claude" ? "Claude" : info.showing == "kimi" ? "Kimi" : "Codex")
                 self.deviceInfoItem.title =
-                    "设备：\(info.ip) · 正在显示 \(showing) · \(sprites.joined(separator: " "))"
+                    "设备：\(info.ip) · 正在显示 \(Self.appDisplayName(info: info)) · \(sprites.joined(separator: " "))"
                 for (mode, item) in self.modeItems { item.state = mode == info.mode ? .on : .off }
             case .failure:
                 self.deviceInfoItem.title = "设备：\(host)（无法连接）"
