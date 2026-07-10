@@ -77,6 +77,7 @@ final class MirrorView: NSView {
     var line1 = "5h -"
     var line2 = "Weekly -"
     var showingClaude = true
+    var showingKimi = false
     var deviceOK = false
     // net-mode mirror: same scrolling area-chart model as the firmware —
     // one column per 250ms sample, 224-column (56s) window, shared "nice"
@@ -118,6 +119,7 @@ final class MirrorView: NSView {
 
     private static let claudeLogo = Bundle.module.image(forResource: "claude-logo")
     private static let codexLogo = Bundle.module.image(forResource: "codex-logo")
+    private static let kimiLogo = Bundle.module.image(forResource: "kimi-logo")
 
     override var isFlipped: Bool { true } // draw in the panel's top-left origin
 
@@ -181,8 +183,16 @@ final class MirrorView: NSView {
         }
 
         // app logo, top-left inside the ring (firmware draws it at 14,18 @40px)
-        if let logo = Self.claudeLogo, let logo2 = Self.codexLogo {
-            (showingClaude ? logo : logo2).draw(in: NSRect(x: 14, y: 18, width: 40, height: 40))
+        let logo: NSImage?
+        if showingClaude {
+            logo = Self.claudeLogo
+        } else if showingKimi {
+            logo = Self.kimiLogo
+        } else {
+            logo = Self.codexLogo
+        }
+        if let logo = logo {
+            logo.draw(in: NSRect(x: 14, y: 18, width: 40, height: 40))
         }
 
         // quota text
@@ -368,7 +378,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private let nowPlaying: NowPlayingMonitor
     private let popover = NSPopover()
     private let mirror = MirrorView()
-    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐"],
+    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "Kimi", "网速", "音乐"],
                                                  trackingMode: .selectOne, target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "连接设备中…")
 
@@ -475,7 +485,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 self.mirror.deviceOK = true
                 self.applyScene(info)
                 self.ensureSprite(info)
-                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3, "music": 4][info.mode] ?? 0
+                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "kimi": 3, "net": 4, "music": 5][info.mode] ?? 0
                 self.modeControl.selectedSegment = modeIdx
                 let modeText = info.mode == "auto" ? "自动切换"
                     : info.mode == "net" ? "网速曲线"
@@ -514,7 +524,8 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             return
         }
         let snap = service.snapshot()
-        mirror.showingClaude = info.showing != "codex"
+        mirror.showingClaude = info.showing == "claude"
+        mirror.showingKimi = info.showing == "kimi"
         if mirror.showingClaude {
             let pct = snap.claude.fiveHourPct
                 ?? (snap.claude.sessionWindowMin > 0
@@ -523,6 +534,11 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.line1 = "5h " + Self.pctText(pct)
             mirror.line2 = "Weekly " + Self.pctText(snap.claude.sevenDayPct)
             mirror.needsInput = snap.claude.needsInput
+        } else if mirror.showingKimi {
+            mirror.ringPct = max(snap.kimi.fiveHourPct ?? -1, 0)
+            mirror.line1 = "5h " + Self.pctText(snap.kimi.fiveHourPct)
+            mirror.line2 = "Weekly " + Self.pctText(snap.kimi.sevenDayPct)
+            mirror.needsInput = snap.kimi.needsInput
         } else {
             mirror.ringPct = snap.codex.primaryPct ?? 0
             mirror.line1 = "5h " + Self.pctText(snap.codex.primaryPct)
@@ -538,9 +554,14 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     private func ensureSprite(_ info: DeviceInfo) {
-        let slot = info.showing == "codex" ? "codex" : "claude"
-        let w = slot == "claude" ? info.claudeW : info.codexW
-        let h = slot == "claude" ? info.claudeH : info.codexH
+        let slot: String
+        let w: Int, h: Int
+        switch info.showing {
+        case "claude": slot = "claude"; w = info.claudeW; h = info.claudeH
+        case "codex": slot = "codex"; w = info.codexW; h = info.codexH
+        case "kimi": slot = "kimi"; w = info.kimiW; h = info.kimiH
+        default: return // net/music modes have no sprite
+        }
         if let cached = spriteCache[slot], cached.rev == info.spriteRev {
             mirror.frames = cached.frames
             mirror.spriteW = cached.w
@@ -556,7 +577,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 let frames = decodeSpriteFrames(data, w: w, h: h)
                 guard !frames.isEmpty else { return }
                 self.spriteCache[slot] = (info.spriteRev, frames, w, h)
-                if (self.lastInfo?.showing == "codex" ? "codex" : "claude") == slot {
+                if self.lastInfo?.showing == slot {
                     self.mirror.frames = frames
                     self.mirror.spriteW = w
                     self.mirror.spriteH = h
@@ -586,8 +607,13 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
 
         guard !mirror.frames.isEmpty else { return }
         let snap = service.snapshot()
-        let working = info.showing == "codex"
-            ? snap.codex.status == "working" : snap.claude.status == "working"
+        let working: Bool
+        switch info.showing {
+        case "claude": working = snap.claude.status == "working"
+        case "codex": working = snap.codex.status == "working"
+        case "kimi": working = snap.kimi.status == "working"
+        default: working = false
+        }
         if working {
             mirror.frameIdx = (mirror.frameIdx + 1) % mirror.frames.count
         } else if mirror.frameIdx != 0 {
@@ -597,7 +623,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func modeChanged() {
-        let mode = ["auto", "claude", "codex", "net", "music"][max(0, modeControl.selectedSegment)]
+        let mode = ["auto", "claude", "codex", "kimi", "net", "music"][max(0, modeControl.selectedSegment)]
         DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
     }
 }

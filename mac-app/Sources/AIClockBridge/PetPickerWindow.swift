@@ -53,7 +53,7 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
         scroll.documentView = tableView
         scroll.hasVerticalScroller = true
 
-        targetPopup.addItems(withTitles: ["Claude 角色", "Codex 角色"])
+        targetPopup.addItems(withTitles: ["Claude 角色", "Codex 角色", "Kimi 角色"])
         statePopup.addItems(withTitles: PetdexService.states.map { $0.label })
         statePopup.selectItem(at: PetdexService.states.firstIndex { $0.id == "running" } ?? 0)
         targetPopup.target = self
@@ -168,7 +168,11 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
 
     /// Device slot pixel sizes must match the firmware's sprite constants.
     private var slotSize: (slot: String, w: Int, h: Int) {
-        targetPopup.indexOfSelectedItem == 0 ? ("claude", 111, 120) : ("codex", 120, 120)
+        switch targetPopup.indexOfSelectedItem {
+        case 0: return ("claude", 111, 120)
+        case 2: return ("kimi", 120, 120)
+        default: return ("codex", 120, 120)
+        }
     }
 
     @objc private func previewSelectionChanged() {
@@ -218,8 +222,9 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
         DeviceClient.uploadGif(gif, slot: s.slot) { [weak self] error in
             guard let self = self else { return }
             self.uploadButton.isEnabled = true
+            let slotName = s.slot == "claude" ? "Claude" : s.slot == "kimi" ? "Kimi" : "Codex"
             self.statusLabel.stringValue = error.map { "上传失败：\($0.localizedDescription)" }
-                ?? "✅ 已应用：\(pet.displayName) 现在是 \(s.slot == "claude" ? "Claude" : "Codex") 的桌宠"
+                ?? "✅ 已应用：\(pet.displayName) 现在是 \(slotName) 的桌宠"
         }
     }
 }

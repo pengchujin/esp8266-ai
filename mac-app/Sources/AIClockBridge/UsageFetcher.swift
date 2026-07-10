@@ -23,6 +23,7 @@ final class UsageFetcher {
     private let lock = NSLock()
     private var _claude = ProviderUsage()
     private var _codex = ProviderUsage()
+    private var _kimi = ProviderUsage()
     private var timer: Timer?
     private var fetching = false
     private var nextAllowedFetch = Date.distantPast // throttle + 429 backoff
@@ -32,6 +33,7 @@ final class UsageFetcher {
 
     var claude: ProviderUsage { lock.lock(); defer { lock.unlock() }; return _claude }
     var codex: ProviderUsage { lock.lock(); defer { lock.unlock() }; return _codex }
+    var kimi: ProviderUsage { lock.lock(); defer { lock.unlock() }; return _kimi }
 
     /// Called on the main thread after either provider updates.
     var onUpdate: (() -> Void)?
@@ -54,6 +56,8 @@ final class UsageFetcher {
             guard let self = self else { return }
             let claude = self.fetchClaude()
             let codex = self.fetchCodex()
+            // Kimi has no public quota API yet; leave _kimi empty so the menu
+            // shows "额度未知" instead of a fake number.
             self.lock.lock()
             // Keep the last good numbers when a refresh only produced an
             // error (network hiccup / 429) - stale quota beats no quota.

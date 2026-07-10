@@ -29,6 +29,7 @@ sealed class UsageFetcher
     readonly object _lock = new();
     ProviderUsage _claude = new();
     ProviderUsage _codex = new();
+    ProviderUsage _kimi = new();
     System.Windows.Forms.Timer _timer;
     bool _fetching;
     DateTime _nextAllowedFetch = DateTime.MinValue; // throttle + 429 backoff
@@ -38,6 +39,7 @@ sealed class UsageFetcher
 
     public ProviderUsage Claude { get { lock (_lock) return _claude; } }
     public ProviderUsage Codex { get { lock (_lock) return _codex; } }
+    public ProviderUsage Kimi { get { lock (_lock) return _kimi; } }
 
     /// Raised on the UI thread after either provider updates.
     public Action OnUpdate;

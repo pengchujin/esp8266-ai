@@ -4,10 +4,11 @@ using System.Text.Json;
 namespace AIClockBridge;
 
 // Port of the Mac StatusReader. No account APIs / keys are touched -
-// everything comes from the JSONL session logs Claude Code and Codex CLI
-// already write to disk (same paths on Windows, under %USERPROFILE%):
-//   ~/.claude/projects/**/*.jsonl   (Claude Code transcripts)
-//   ~/.codex/sessions/**/*.jsonl    (Codex CLI rollouts, incl. rate_limits)
+// everything comes from the JSONL session logs Claude Code, Codex CLI and
+// kimi-code already write to disk (same paths on Windows, under %USERPROFILE%):
+//   ~/.claude/projects/**/*.jsonl      (Claude Code transcripts)
+//   ~/.codex/sessions/**/*.jsonl       (Codex CLI rollouts, incl. rate_limits)
+//   ~/.kimi-code/sessions/**/wire.jsonl (kimi-code usage records)
 
 class ClaudeStatus
 {
@@ -35,10 +36,22 @@ class CodexStatus
     public bool NeedsInput;
 }
 
+class KimiStatus
+{
+    public string Status = "offline";
+    public int TokensToday;
+    public double? FiveHourPct;
+    public int? FiveHourResetMin;
+    public double? SevenDayPct;
+    public int? SevenDayResetMin;
+    public bool NeedsInput;
+}
+
 class StatusSnapshot
 {
     public ClaudeStatus Claude = new();
     public CodexStatus Codex = new();
+    public KimiStatus Kimi = new();
     public long Ts;
     public bool MusicPlaying;
 
@@ -73,6 +86,17 @@ class StatusSnapshot
             WriteNullable(w, "weekly_reset_min", Codex.WeeklyResetMin);
             w.WriteBoolean("needs_input", Codex.NeedsInput);
             w.WriteEndObject();
+            w.WriteStartObject("kimi");
+            w.WriteString("status", Kimi.Status);
+            w.WriteNumber("tokens_today", Kimi.TokensToday);
+            w.WriteNumber("session_min", 0);
+            w.WriteNumber("session_window_min", 300);
+            WriteNullable(w, "five_hour_pct", Kimi.FiveHourPct);
+            WriteNullable(w, "five_hour_reset_min", Kimi.FiveHourResetMin);
+            WriteNullable(w, "seven_day_pct", Kimi.SevenDayPct);
+            WriteNullable(w, "seven_day_reset_min", Kimi.SevenDayResetMin);
+            w.WriteBoolean("needs_input", Kimi.NeedsInput);
+            w.WriteEndObject();
             w.WriteEndObject();
         }
         return ms.ToArray();
@@ -90,10 +114,11 @@ class StatusSnapshot
 
     StatusSnapshot() { }
 
-    public StatusSnapshot(ClaudeStatus claude, CodexStatus codex, long ts)
+    public StatusSnapshot(ClaudeStatus claude, CodexStatus codex, KimiStatus kimi, long ts)
     {
         Claude = claude;
         Codex = codex;
+        Kimi = kimi;
         Ts = ts;
     }
 
@@ -103,6 +128,7 @@ class StatusSnapshot
         {
             Claude = (ClaudeStatus)Claude.MemberwiseCloneOf(),
             Codex = (CodexStatus)Codex.MemberwiseCloneOf(),
+            Kimi = (KimiStatus)Kimi.MemberwiseCloneOf(),
             Ts = Ts,
             MusicPlaying = MusicPlaying,
         };
@@ -128,6 +154,8 @@ sealed class StatusService
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
     readonly string _codexDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "sessions");
+    readonly string _kimiDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".kimi-code", "sessions");
 
     /// Real OAuth quota (5h/weekly windows) merged into snapshots when set;
     /// log-derived values remain the fallback for offline use.
@@ -137,7 +165,7 @@ sealed class StatusService
     /// auto-switch). Set from NowPlayingMonitor in Program.
     public Func<bool> MusicPlayingProvider;
 
-    // Hook-pushed live state (POST /event from Claude Code / Codex hooks).
+    // Hook-pushed live state (POST /event from Claude Code / Codex / Kimi hooks).
     // Events beat the mtime heuristic while fresh: "working" for up to 10min
     // (a long tool run emits nothing between PreToolUse and PostToolUse),
     // "idle" for 60s (long enough to kill the mtime tail after Stop, short
@@ -146,11 +174,13 @@ sealed class StatusService
 
     AgentEvent _claudeEvent;
     AgentEvent _codexEvent;
+    AgentEvent _kimiEvent;
     // "needs input": a permission/approval prompt is on screen, waiting on the
     // user. Set by an attention event, cleared by the next concrete lifecycle
     // event (the prompt got answered) or by TTL.
     double? _claudeNeedsInputAt;
     double? _codexNeedsInputAt;
+    double? _kimiNeedsInputAt;
     const double WorkingEventTTL = 10 * 60;
     const double IdleEventTTL = 60;
     const double NeedsInputTTL = 5 * 60;
@@ -195,6 +225,7 @@ sealed class StatusService
             {
                 if (agent == "claude") _claudeNeedsInputAt = now;
                 else if (agent == "codex") _codexNeedsInputAt = now;
+                else if (agent == "kimi") _kimiNeedsInputAt = now;
                 return;
             }
             string state;
@@ -205,6 +236,7 @@ sealed class StatusService
             // any concrete lifecycle event means the prompt (if any) was answered
             if (agent == "claude") { _claudeEvent = e; _claudeNeedsInputAt = null; }
             else if (agent == "codex") { _codexEvent = e; _codexNeedsInputAt = null; }
+            else if (agent == "kimi") { _kimiEvent = e; _kimiNeedsInputAt = null; }
         }
     }
 
@@ -244,7 +276,7 @@ sealed class StatusService
             }
             else
             {
-                snap = new StatusSnapshot(ReadClaude(), ReadCodex(), (long)now);
+                snap = new StatusSnapshot(ReadClaude(), ReadCodex(), ReadKimi(), (long)now);
                 _cached = snap.Clone();
                 _cachedAt = now;
             }
@@ -273,8 +305,10 @@ sealed class StatusService
             }
             snap.Claude.Status = OverrideStatus(snap.Claude.Status, _claudeEvent, now);
             snap.Codex.Status = OverrideStatus(snap.Codex.Status, _codexEvent, now);
+            snap.Kimi.Status = OverrideStatus(snap.Kimi.Status, _kimiEvent, now);
             snap.Claude.NeedsInput = NeedsInput(_claudeNeedsInputAt, now);
             snap.Codex.NeedsInput = NeedsInput(_codexNeedsInputAt, now);
+            snap.Kimi.NeedsInput = NeedsInput(_kimiNeedsInputAt, now);
             snap.MusicPlaying = MusicPlayingProvider?.Invoke() ?? false;
             return snap;
         }
@@ -512,6 +546,63 @@ sealed class StatusService
             }
         }
         latestRateLimitsDoc?.Dispose();
+        return s;
+    }
+
+    // MARK: - Kimi
+
+    KimiStatus ReadKimi()
+    {
+        var todayStart = TodayStartEpoch();
+        var now = Now();
+        var tokensToday = 0;
+        double lastMtime = 0;
+
+        if (!Directory.Exists(_kimiDir)) return new KimiStatus { Status = StatusFromDelta(1e9) };
+        IEnumerable<string> files;
+        try
+        {
+            files = Directory.EnumerateFiles(_kimiDir, "wire.jsonl", SearchOption.AllDirectories);
+        }
+        catch
+        {
+            files = Array.Empty<string>();
+        }
+        foreach (var file in files)
+        {
+            double mtime;
+            try
+            {
+                mtime = new DateTimeOffset(File.GetLastWriteTimeUtc(file), TimeSpan.Zero)
+                    .ToUnixTimeMilliseconds() / 1000.0;
+            }
+            catch
+            {
+                continue;
+            }
+            if (mtime > lastMtime) lastMtime = mtime;
+            if (mtime < todayStart) continue;
+            var lines = ReadLines(file);
+            if (lines == null) continue;
+            foreach (var line in lines)
+            {
+                if (!line.Contains("\"type\":\"usage.record\"")) continue;
+                JsonDocument doc;
+                try { doc = JsonDocument.Parse(line); } catch { continue; }
+                using (doc)
+                {
+                    var root = doc.RootElement;
+                    if (!TryProp(root, "usage", out var usage)) continue;
+                    var entryEpoch = DoubleVal(root, "time");
+                    if (entryEpoch.HasValue && entryEpoch.Value / 1000.0 < todayStart) continue;
+                    tokensToday += IntVal(usage, "inputOther") + IntVal(usage, "output")
+                        + IntVal(usage, "inputCacheRead") + IntVal(usage, "inputCacheCreation");
+                }
+            }
+        }
+
+        var s = new KimiStatus { TokensToday = tokensToday };
+        s.Status = StatusFromDelta(lastMtime > 0 ? now - lastMtime : 1e9);
         return s;
     }
 }

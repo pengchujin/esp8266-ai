@@ -1,16 +1,18 @@
 # ESP8266 AI 状态时钟
 
-一个 ESP8266 WiFi 时钟固件：显示时间 + Claude Code / Codex CLI 的实时工作状态和用量。
-不需要任何官方账单 API key —— 数据来自两处本地已有的来源：
+一个 ESP8266 WiFi 时钟固件：显示时间 + Claude Code / Codex CLI / kimi-code 的实时工作状态和用量。
+不需要任何官方账单 API key —— 数据来自本地已有的来源：
 
 - **工作状态**（working/idle/offline）：本地会话日志的新旧程度
   - `~/.claude/projects/**/*.jsonl`（Claude Code 会话记录）
   - `~/.codex/sessions/**/*.jsonl`（Codex CLI 会话记录）
-- **真实额度**（5h / 周窗口用量百分比 + 重置时间）：复用两个 CLI 已经存在本机的
+  - `~/.kimi-code/sessions/**/wire.jsonl`（kimi-code 会话记录）
+- **真实额度**（5h / 周窗口用量百分比 + 重置时间）：复用 Claude / Codex 两个 CLI 已经存在本机的
   OAuth 登录凭据，直接调各自官方用量接口（做法与
   [CodexBar](https://github.com/steipete/CodexBar) 相同，token 只发给各自官方 API）：
   - Claude：Keychain 里的 `Claude Code-credentials` → `api.anthropic.com/api/oauth/usage`
   - Codex：`~/.codex/auth.json` → `chatgpt.com/backend-api/wham/usage`
+  - kimi-code：目前没有公开的用量接口，额度显示“额度未知”
 
 架构：`mac-app/` 是一个 **Swift 原生菜单栏 app**（Windows 用户用 `windows-app/`，
 功能一致的 C# 托盘移植版），读日志、开一个本地 HTTP 服务；
@@ -54,7 +56,7 @@ swift run                # 前台运行；或 swift build 后跑 .build/debug/AI
   也会自愈。菜单项走完整流程：最近来访 IP → 已配置地址复验 → 子网 /24 扫描兜底
   （覆盖"刚配完 WiFi、还没设过桥接"的全新设备）。
 - **设置设备地址…**：手动填时钟的 IP（开机时屏幕会显示；有自动配对后基本用不上）
-- **屏幕显示**：自动（谁在干活显示谁）/ 固定 Claude / 固定 Codex
+- **屏幕显示**：自动（谁在干活显示谁）/ 固定 Claude / 固定 Codex / 固定 Kimi
 - **音乐播放**：显示 Mac 当前播放的专辑封面、歌曲、歌手和进度
 - **更换桌宠动画…**：内置 [petdex.dev](https://petdex.dev) 画廊（3300+ 开源桌宠），
   搜索 → 选动画（待机/跑步/挥手…9 种）→ 预览 → 一键上传到设备
@@ -73,7 +75,10 @@ curl -s http://localhost:8765/status | python3 -m json.tool
 {
   "claude": {"status": "working", "tokens_today": 4868001, "session_min": 26, "session_window_min": 300},
   "codex":  {"status": "offline", "tokens_today": 61471, "primary_pct": 1.0, "primary_window_min": 300,
-             "primary_reset_min": 0, "weekly_pct": 2.0, "weekly_window_min": 10080, "weekly_reset_min": 8729}
+             "primary_reset_min": 0, "weekly_pct": 2.0, "weekly_window_min": 10080, "weekly_reset_min": 8729},
+  "kimi":   {"status": "idle", "tokens_today": 12500, "session_min": 0, "session_window_min": 300,
+             "five_hour_pct": null, "five_hour_reset_min": null,
+             "seven_day_pct": null, "seven_day_reset_min": null, "needs_input": false}
 }
 ```
 
@@ -151,17 +156,17 @@ pio device monitor -b 115200
 
 ## 3. 屏幕布局
 
-全屏单应用视图（不显示时钟），一次只显示 Claude 或 Codex 其中一个，规则：
+全屏单应用视图（不显示时钟），一次只显示 Claude / Codex / Kimi 其中一个，规则：
 
 - **只有一方在工作** → 固定显示正在工作的那个
-- **两方都在工作** → 每 2 秒交替
+- **多方都在工作** → 每 2 秒交替
 - **都空闲** → 每 6 秒慢速交替
 - Mac 菜单栏里也可以强制固定显示某一方（`POST /api/display`），固定后忽略上述规则
 
 视觉元素：
 
-- 屏幕中央：对应角色的大幅像素动画（Claude = 跑步的 Dario，Codex = 戴耳机的宠物），
-  仅在该角色 `working` 时播放动画，否则停在静止帧。
+- 屏幕中央：对应角色的大幅像素动画（Claude = 跑步的 Dario，Codex = 戴耳机的宠物，
+  Kimi = 银月角色），仅在该角色 `working` 时播放动画，否则停在静止帧。
 - 屏幕四周一圈方形进度环：环的填充长度 = 用量百分比（Claude 用 5 小时滚动窗口已用
   比例近似，Codex 用真实的 5h `primary_pct`）；环的颜色/动画参考
   [vibecoding-signal-light](https://github.com/starlight36/vibecoding-signal-light)
@@ -170,8 +175,8 @@ pio device monitor -b 115200
   - **绿→黄→红缓慢循环** = 正在工作
   - **红色闪烁**（最高优先级，覆盖其他状态）= 桥接服务连不上或数据过期（超过
     2 个轮询周期没更新），需要马上看一眼
-- **整圈边框红色闪烁 = 需要你确认操作**：Claude / Codex 弹出权限/审批选择时（Claude
-  的 `Notification`、Codex 的 `PermissionRequest` hook），设备整圈边框红色闪烁提醒你去
+- **整圈边框红色闪烁 = 需要你确认操作**：Claude / Codex / Kimi 弹出权限/审批选择时（Claude
+  的 `Notification`、Codex / Kimi 的 `PermissionRequest` / `Elicitation` hook），设备整圈边框红色闪烁提醒你去
   确认；AUTO 模式还会自动切到那个待审批的角色（优先级高于音乐自动切换）。你在 CLI 里
   做出选择后（下一个工具调用/回合事件到达）自动停止闪烁，5 分钟无响应也会自动超时清除。
   Mac 弹窗镜像同步显示红色边框闪烁。
@@ -184,7 +189,7 @@ pio device monitor -b 115200
    manifest（`assets.petdex.dev/manifests/petdex-v1.json`，3300+ 开源桌宠）搜索选择。
    每个桌宠是一张 1536x1872 的 WebP 精灵图（8 列 x 9 行，每帧 192x208，每行一种动画：
    待机/左右跑/挥手/跳跃/失败/等待/原地跑/思考）。app 在本地裁出所选动画行、缩放到
-   目标插槽尺寸、合成黑底循环 GIF，然后 POST 到设备的 `/sprite/claude|codex`。
+   目标插槽尺寸、合成黑底循环 GIF，然后 POST 到设备的 `/sprite/claude|codex|kimi`。
 2. **设备网页** `http://<设备IP>/`：手动上传任意 `.gif`，适合用自己的图。
 
 两条路最终都走同一条链路：设备收到 GIF 后**自己在板上解码并缩放**，立刻替换该角色的
@@ -195,11 +200,11 @@ pio device monitor -b 115200
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/info` | 设备状态 JSON：ip/ssid/bridge/显示模式/当前显示/自定义精灵标记 |
-| POST | `/api/display` | `mode=auto\|claude\|codex\|net\|music` 切换屏幕显示（net=网速曲线页，music=音乐播放页）|
+| POST | `/api/display` | `mode=auto\|claude\|codex\|kimi\|net\|music` 切换屏幕显示（net=网速曲线页，music=音乐播放页）|
 | POST | `/api/bridge` | `host=ip:port` 设置桥接地址 |
-| POST | `/sprite/claude`、`/sprite/codex` | multipart 上传 GIF 并板上解码替换 |
-| POST | `/sprite/claude/reset`、`/sprite/codex/reset` | 删除自定义动画，恢复内置形象 |
-| GET | `/sprite/claude/raw`、`/sprite/codex/raw` | 当前生效动画的原始帧流 `[1B帧数][RGB565大端帧...]`（镜像窗口用）|
+| POST | `/sprite/claude`、`/sprite/codex`、`/sprite/kimi` | multipart 上传 GIF 并板上解码替换 |
+| POST | `/sprite/claude/reset`、`/sprite/codex/reset`、`/sprite/kimi/reset` | 删除自定义动画，恢复内置形象 |
+| GET | `/sprite/claude/raw`、`/sprite/codex/raw`、`/sprite/kimi/raw` | 当前生效动画的原始帧流 `[1B帧数][RGB565大端帧...]`（镜像窗口用）|
 
 `/api/info` 里的 `sprite_rev` 在每次上传/重置动画后自增，镜像端据此决定是否重新拉帧。
 
@@ -246,10 +251,10 @@ Mac 端常驻进程由 LaunchAgent（`~/Library/LaunchAgents/local.AIClockBridge
 
 ## 7. Hooks 实时状态（秒级，参考 clawd-on-desk 的做法）
 
-除了日志 mtime 轮询（保留为兜底），bridge 还接收两个 CLI 官方 hooks 的事件推送，
+除了日志 mtime 轮询（保留为兜底），bridge 还接收三个 CLI 官方 hooks 的事件推送，
 状态切换从"最多迟滞 20 秒"变成"毫秒级"：
 
-- bridge 新增 `POST /event`，body：`{"agent":"claude|codex","event":"PreToolUse"}`
+- bridge 新增 `POST /event`，body：`{"agent":"claude|codex|kimi","event":"PreToolUse"}`
 - `~/.claude/settings.json` 已注册 8 个事件的 curl hook（UserPromptSubmit/PreToolUse/
   PostToolUse/Stop/SessionEnd/Notification/PreCompact/SubagentStop，每条 `-m 1` 超时，
   不会拖慢 Claude Code；与已有 hooks 共存，靠命令里的 `8765/event` 标记幂等）
@@ -257,15 +262,56 @@ Mac 端常驻进程由 LaunchAgent（`~/Library/LaunchAgents/local.AIClockBridge
   Stop/Notification 等 → idle（TTL 60 秒，只用来立刻压掉 mtime 的"工作尾巴"）
 - Codex 侧已写入 `~/.codex/hooks.json` + `config.toml [features] hooks = true`，
   但 Codex 要求在 TUI 里跑一次 `/hooks` 信任新命令后才生效；未信任前走 mtime 兜底。
+- Kimi 侧在 `~/.kimi-code/config.toml` 里注册 hooks（示例见下），kimi-code 启动时会
+  自动加载；未配置时同样走 mtime 兜底。
 - 局限：事件是全局的不分会话——A 会话 Stop 会把还在干活的 B 会话压成 idle 最多 60 秒
   （B 的下一个工具调用事件会立刻翻回 working）。
+
+### kimi-code hooks 配置示例
+
+在 `~/.kimi-code/config.toml` 里加入：
+
+```toml
+[hooks]
+enabled = true
+
+[[hooks.commands]]
+event = "UserPromptSubmit"
+command = "curl"
+args = ["-m", "1", "-s", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"agent":"kimi","event":"UserPromptSubmit"}', "http://127.0.0.1:8765/event"]
+
+[[hooks.commands]]
+event = "PreToolUse"
+command = "curl"
+args = ["-m", "1", "-s", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"agent":"kimi","event":"PreToolUse"}', "http://127.0.0.1:8765/event"]
+
+[[hooks.commands]]
+event = "PostToolUse"
+command = "curl"
+args = ["-m", "1", "-s", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"agent":"kimi","event":"PostToolUse"}', "http://127.0.0.1:8765/event"]
+
+[[hooks.commands]]
+event = "Stop"
+command = "curl"
+args = ["-m", "1", "-s", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"agent":"kimi","event":"Stop"}', "http://127.0.0.1:8765/event"]
+
+[[hooks.commands]]
+event = "PermissionRequest"
+command = "curl"
+args = ["-m", "1", "-s", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"agent":"kimi","event":"PermissionRequest"}', "http://127.0.0.1:8765/event"]
+
+[[hooks.commands]]
+event = "Elicitation"
+command = "curl"
+args = ["-m", "1", "-s", "-X", "POST", "-H", "Content-Type: application/json", "-d", '{"agent":"kimi","event":"Elicitation"}', "http://127.0.0.1:8765/event"]
+```
 
 ### GIF 上传架构
 
 架构：GIF 通过 `ESP8266WebServer` 的 multipart 文件上传（`HTTPUpload` 回调）边收边流式
-写进 LittleFS 的临时文件（`/c.gif` / `/x.gif`），然后固件用
+写进 LittleFS 的临时文件（`/c.gif` / `/x.gif` / `/k.gif`），然后固件用
 [AnimatedGIF](https://github.com/bitbank2/AnimatedGIF) 库**逐行解码**成设备要的 RGB565
-帧，写入 `/c.bin` / `/x.bin`（格式 `[1字节帧数][各帧像素...]`），最后删掉临时 GIF。
+帧，写入 `/c.bin` / `/x.bin` / `/k.bin`（格式 `[1字节帧数][各帧像素...]`），最后删掉临时 GIF。
 
 ESP8266 总共只有 ~80KB RAM，一帧 120x120 的 RGB565 就 ~28KB，AnimatedGIF 自己也要
 ~24KB，两个大缓冲塞不下，所以整条链路都是**逐行流式、不常驻整帧**：
@@ -281,7 +327,7 @@ ESP8266 总共只有 ~80KB RAM，一帧 120x120 的 RGB565 就 ~28KB，AnimatedG
 **注意事项 / 局限**：
 
 - GIF 太大（尺寸很大、颜色/帧很多）可能因内存不足解码失败，页面会报错，换小一点的即可。
-- 目标插槽尺寸固定：Claude 111x120、Codex 120x120，板上会最近邻缩放匹配（质量不如
+- 目标插槽尺寸固定：Claude 111x120、Codex 120x120、Kimi 120x120，板上会最近邻缩放匹配（质量不如
   PIL 的 LANCZOS，像素风 GIF 通常没问题）。
 - 最多取 GIF 的**前 8 帧**（没有整体帧数信息，就不做均匀抽帧了）。
 - disposal method 2（"恢复到背景色"）没有单独区分，未覆盖像素保留上一帧而不是清空；
@@ -298,5 +344,6 @@ ESP8266 总共只有 ~80KB RAM，一帧 120x120 的 RGB565 就 ~28KB，AnimatedG
   沿用旧值，偶尔菜单里额度会显示为几分钟前的数据。
 - 未做开机自启 LaunchAgent，需要的话可以再加（见第 1 节）。
 - 改**默认**编译进固件的动画（`firmware/include/img/claude_sprite.h` /
-  `codex_sprite.h`）仍可用 `tools/convert_sprites.py` 生成新的 `.h` 后 `pio run -t upload`；
+  `codex_sprite.h` / `kimi_sprite.h`）仍可用 `tools/convert_sprites.py` 生成新的 `.h` 后 `pio run -t upload`；
   日常换形象用菜单栏 petdex 选择器或设备网页即可，无需烧录。
+- 新增 Kimi 支持后，ESP8266 固件需要重新烧录一次；Mac / Windows bridge 端升级后无需烧录。

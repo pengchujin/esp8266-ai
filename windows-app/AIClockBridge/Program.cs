@@ -7,7 +7,7 @@ namespace AIClockBridge;
 // server that the ESP8266 clock polls — the same endpoints and JSON shapes as
 // the Mac app, so the firmware can't tell which OS the bridge runs on.
 // Headless smoke test for the petdex -> GIF -> device pipeline (same code the
-// pet picker window uses): AIClockBridge --test-pet <slug> <claude|codex> <host>
+// pet picker window uses): AIClockBridge --test-pet <slug> <claude|codex|kimi> <host>
 static class Program
 {
     const int Port = 8765;
@@ -47,7 +47,7 @@ static class Program
             },
             postRoutes: new()
             {
-                // Claude Code / Codex hooks push lifecycle events here (README §7):
+                // Claude Code / Codex / Kimi hooks push lifecycle events here (README §7):
                 // curl -d '{"agent":"claude","event":"PreToolUse"}' http://127.0.0.1:8765/event
                 ["/event"] = body =>
                 {
@@ -113,7 +113,12 @@ static class Program
         var slug = args[1];
         var slot = args[2];
         if (args.Length >= 4) DeviceClient.Host = args[3];
-        var (w, h) = slot == "claude" ? (111, 120) : (120, 120);
+        var (w, h) = slot switch
+        {
+            "claude" => (111, 120),
+            "kimi" => (120, 120),
+            _ => (120, 120), // codex
+        };
         var state = PetdexService.States.First(s => s.Id == "running");
         try
         {

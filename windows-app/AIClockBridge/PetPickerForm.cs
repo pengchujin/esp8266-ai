@@ -4,8 +4,8 @@ using SixLabors.ImageSharp.PixelFormats;
 namespace AIClockBridge;
 
 // "更换桌宠动画" window: browse petdex.dev's gallery, preview an animation
-// row, and push it to the clock as the Claude or Codex character. Singleton
-// so the tray menu can open it repeatedly.
+// row, and push it to the clock as the Claude, Codex or Kimi character.
+// Singleton so the tray menu can open it repeatedly.
 sealed class PetPickerForm : Form
 {
     static PetPickerForm _shared;
@@ -47,7 +47,7 @@ sealed class PetPickerForm : Form
         _listBox.SelectedIndexChanged += (_, _) => PreviewSelectionChanged();
 
         _targetCombo.DropDownStyle = ComboBoxStyle.DropDownList;
-        _targetCombo.Items.AddRange(new object[] { "Claude 角色", "Codex 角色" });
+        _targetCombo.Items.AddRange(new object[] { "Claude 角色", "Codex 角色", "Kimi 角色" });
         _targetCombo.SelectedIndex = 0;
         _targetCombo.SelectedIndexChanged += (_, _) => PreviewSelectionChanged();
 
@@ -144,8 +144,12 @@ sealed class PetPickerForm : Form
         PetdexService.States[Math.Max(0, _stateCombo.SelectedIndex)];
 
     /// Device slot pixel sizes must match the firmware's sprite constants.
-    (string Slot, int W, int H) SlotSize =>
-        _targetCombo.SelectedIndex == 0 ? ("claude", 111, 120) : ("codex", 120, 120);
+    (string Slot, int W, int H) SlotSize => _targetCombo.SelectedIndex switch
+    {
+        0 => ("claude", 111, 120),
+        2 => ("kimi", 120, 120),
+        _ => ("codex", 120, 120),
+    };
 
     async void PreviewSelectionChanged()
     {
@@ -216,8 +220,8 @@ sealed class PetPickerForm : Form
         try
         {
             await DeviceClient.UploadGif(gif, s.Slot);
-            _statusLabel.Text =
-                $"✅ 已应用：{pet.DisplayName} 现在是 {(s.Slot == "claude" ? "Claude" : "Codex")} 的桌宠";
+            var slotName = s.Slot == "claude" ? "Claude" : s.Slot == "kimi" ? "Kimi" : "Codex";
+            _statusLabel.Text = $"✅ 已应用：{pet.DisplayName} 现在是 {slotName} 的桌宠";
         }
         catch (Exception e)
         {

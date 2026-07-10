@@ -15,15 +15,17 @@ class DeviceInfo
     public string Ip = "";
     public string Ssid = "";
     public string Bridge = "";
-    public string Mode = "auto";       // configured: auto | claude | codex | net | music
+    public string Mode = "auto";       // configured: auto | claude | codex | kimi | net | music
     public string Effective = "auto";  // what's actually on screen (AUTO may promote to music)
     public string Showing = "";
     public int LastUpdateS = -1;       // seconds since the device last got /status data, -1 = never
     public int SpriteRev;              // bumped by the device on animation change
     public bool ClaudeCustomSprite;
     public bool CodexCustomSprite;
+    public bool KimiCustomSprite;
     public int ClaudeW = 111, ClaudeH = 120;
     public int CodexW = 120, CodexH = 120;
+    public int KimiW = 120, KimiH = 120;
 }
 
 class DeviceException : Exception
@@ -112,6 +114,12 @@ static class DeviceClient
                 info.CodexW = Int(codex, "w", 120);
                 info.CodexH = Int(codex, "h", 120);
             }
+            if (root.TryGetProperty("kimi", out var kimi))
+            {
+                info.KimiCustomSprite = Bool(kimi, "custom_sprite");
+                info.KimiW = Int(kimi, "w", 120);
+                info.KimiH = Int(kimi, "h", 120);
+            }
             return info;
         }
         catch (Exception)
@@ -120,7 +128,7 @@ static class DeviceClient
         }
     }
 
-    /// POST /api/display  mode=auto|claude|codex|net|music
+    /// POST /api/display  mode=auto|claude|codex|kimi|net|music
     public static Task SetDisplayMode(string mode) =>
         PostForm("api/display", new() { ["mode"] = mode });
 
@@ -128,7 +136,7 @@ static class DeviceClient
     public static Task SetBridgeHost(string bridgeHost) =>
         PostForm("api/bridge", new() { ["host"] = bridgeHost });
 
-    /// POST /sprite/{claude|codex}  multipart GIF upload — the device decodes
+    /// POST /sprite/{claude|codex|kimi}  multipart GIF upload — the device decodes
     /// and rescales the GIF on-board, then swaps the animation immediately.
     public static async Task UploadGif(byte[] gif, string slot)
     {
@@ -150,10 +158,10 @@ static class DeviceClient
         using (resp) await ThrowUnlessOk(resp);
     }
 
-    /// POST /sprite/{claude|codex}/reset — back to the compiled-in animation.
+    /// POST /sprite/{claude|codex|kimi}/reset — back to the compiled-in animation.
     public static Task ResetSprite(string slot) => PostForm($"sprite/{slot}/reset", new());
 
-    /// GET /sprite/{claude|codex}/raw — the animation the device is actually
+    /// GET /sprite/{claude|codex|kimi}/raw — the animation the device is actually
     /// using, wire format [1 byte frame count][RGB565 big-endian frames...].
     public static async Task<byte[]> FetchSpriteRaw(string slot)
     {

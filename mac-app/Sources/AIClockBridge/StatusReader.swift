@@ -30,9 +30,20 @@ struct CodexStatus {
     var needsInput: Bool = false
 }
 
+struct KimiStatus {
+    var status: String = "offline"
+    var tokensToday: Int = 0
+    var fiveHourPct: Double? = nil
+    var fiveHourResetMin: Int? = nil
+    var sevenDayPct: Double? = nil
+    var sevenDayResetMin: Int? = nil
+    var needsInput: Bool = false
+}
+
 struct Snapshot {
     var claude: ClaudeStatus
     var codex: CodexStatus
+    var kimi: KimiStatus
     var ts: Int
     var musicPlaying: Bool = false
 }
@@ -42,6 +53,7 @@ struct Snapshot {
 final class StatusService {
     private let claudeDir = ("~/.claude/projects" as NSString).expandingTildeInPath
     private let codexDir = ("~/.codex/sessions" as NSString).expandingTildeInPath
+    private let kimiDir = ("~/.kimi-code/sessions" as NSString).expandingTildeInPath
 
     /// Real OAuth quota (5h/weekly windows) merged into snapshots when set;
     /// log-derived values remain the fallback for offline use.
@@ -63,11 +75,13 @@ final class StatusService {
 
     private var claudeEvent: AgentEvent?
     private var codexEvent: AgentEvent?
+    private var kimiEvent: AgentEvent?
     // "needs input": a permission/approval prompt is on screen, waiting on the
     // user. Set by an attention event, cleared by the next concrete lifecycle
     // event (the prompt got answered) or by TTL.
     private var claudeNeedsInputAt: TimeInterval?
     private var codexNeedsInputAt: TimeInterval?
+    private var kimiNeedsInputAt: TimeInterval?
     private let workingEventTTL: TimeInterval = 10 * 60
     private let idleEventTTL: TimeInterval = 60
     private let needsInputTTL: TimeInterval = 5 * 60
@@ -110,6 +124,7 @@ final class StatusService {
         if Self.attentionEvents.contains(event) {
             if agent == "claude" { claudeNeedsInputAt = now }
             else if agent == "codex" { codexNeedsInputAt = now }
+            else if agent == "kimi" { kimiNeedsInputAt = now }
             return
         }
         let state: String
@@ -120,6 +135,7 @@ final class StatusService {
         // any concrete lifecycle event means the prompt (if any) was answered
         if agent == "claude" { claudeEvent = ev; claudeNeedsInputAt = nil }
         else if agent == "codex" { codexEvent = ev; codexNeedsInputAt = nil }
+        else if agent == "kimi" { kimiEvent = ev; kimiNeedsInputAt = nil }
     }
 
     private func needsInput(_ at: TimeInterval?, now: TimeInterval) -> Bool {
@@ -165,7 +181,7 @@ final class StatusService {
         if let c = cached, now - cachedAt < cacheTTL {
             snap = c
         } else {
-            snap = Snapshot(claude: readClaude(), codex: readCodex(), ts: Int(now))
+            snap = Snapshot(claude: readClaude(), codex: readCodex(), kimi: readKimi(), ts: Int(now))
             cached = snap
             cachedAt = now
         }
@@ -191,8 +207,10 @@ final class StatusService {
         }
         snap.claude.status = overrideStatus(snap.claude.status, with: claudeEvent, now: now)
         snap.codex.status = overrideStatus(snap.codex.status, with: codexEvent, now: now)
+        snap.kimi.status = overrideStatus(snap.kimi.status, with: kimiEvent, now: now)
         snap.claude.needsInput = needsInput(claudeNeedsInputAt, now: now)
         snap.codex.needsInput = needsInput(codexNeedsInputAt, now: now)
+        snap.kimi.needsInput = needsInput(kimiNeedsInputAt, now: now)
         snap.musicPlaying = musicPlayingProvider?() ?? false
         return snap
     }
@@ -338,6 +356,42 @@ final class StatusService {
         }
         return s
     }
+
+    // MARK: - Kimi
+
+    private func readKimi() -> KimiStatus {
+        let todayStart = todayStartEpoch()
+        let now = Date().timeIntervalSince1970
+        var tokensToday = 0
+        var lastMtime: TimeInterval = 0
+
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: kimiDir)
+        guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else {
+            return KimiStatus(status: statusFromDelta(1e9))
+        }
+        for case let url as URL in en where url.lastPathComponent == "wire.jsonl" {
+            guard let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate?.timeIntervalSince1970 else { continue }
+            if mtime > lastMtime { lastMtime = mtime }
+            if mtime < todayStart { continue }
+            guard let lines = readLines(url) else { continue }
+            for line in lines {
+                if !line.contains("\"type\":\"usage.record\"") { continue }
+                guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let usage = obj["usage"] as? [String: Any] else { continue }
+                let entryEpoch = (obj["time"] as? NSNumber)?.doubleValue
+                if let e = entryEpoch, e / 1000.0 < todayStart { continue }
+                tokensToday += intVal(usage["inputOther"]) + intVal(usage["output"])
+                    + intVal(usage["inputCacheRead"]) + intVal(usage["inputCacheCreation"])
+            }
+        }
+
+        var s = KimiStatus()
+        s.tokensToday = tokensToday
+        s.status = statusFromDelta(lastMtime > 0 ? now - lastMtime : 1e9)
+        return s
+    }
 }
 
 extension Snapshot {
@@ -369,6 +423,17 @@ extension Snapshot {
                 "weekly_window_min": num(codex.weeklyWindowMin),
                 "weekly_reset_min": num(codex.weeklyResetMin),
                 "needs_input": codex.needsInput,
+            ],
+            "kimi": [
+                "status": kimi.status,
+                "tokens_today": kimi.tokensToday,
+                "session_min": 0,
+                "session_window_min": 300,
+                "five_hour_pct": num(kimi.fiveHourPct),
+                "five_hour_reset_min": num(kimi.fiveHourResetMin),
+                "seven_day_pct": num(kimi.sevenDayPct),
+                "seven_day_reset_min": num(kimi.sevenDayResetMin),
+                "needs_input": kimi.needsInput,
             ],
         ]
         return (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)

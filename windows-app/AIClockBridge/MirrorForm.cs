@@ -27,6 +27,7 @@ sealed class MirrorControl : Control
     public string Line1 = "5h -";
     public string Line2 = "Weekly -";
     public bool ShowingClaude = true;
+    public bool ShowingKimi;
     public bool DeviceOK;
     // net-mode mirror: same scrolling area-chart model as the firmware —
     // one column per 250ms sample, 224-column (56s) window, shared "nice"
@@ -48,6 +49,7 @@ sealed class MirrorControl : Control
 
     static readonly Image ClaudeLogo = LoadAsset("claude-logo.png");
     static readonly Image CodexLogo = LoadAsset("codex-logo.png");
+    static readonly Image KimiLogo = LoadAsset("kimi-logo.png");
 
     static readonly Color Green = Color.FromArgb(0, 217, 51);
     static readonly Color Yellow = Color.FromArgb(255, 204, 0);
@@ -152,7 +154,11 @@ sealed class MirrorControl : Control
         }
 
         // app logo, top-left inside the ring (firmware draws it at 14,18 @40px)
-        g.DrawImage(ShowingClaude ? ClaudeLogo : CodexLogo, new Rectangle(14, 18, 40, 40));
+        Image logo;
+        if (ShowingClaude) logo = ClaudeLogo;
+        else if (ShowingKimi) logo = KimiLogo;
+        else logo = CodexLogo;
+        g.DrawImage(logo, new Rectangle(14, 18, 40, 40));
 
         // quota text
         using (var font = new Font("Consolas", 13, FontStyle.Bold, GraphicsUnit.Pixel))
@@ -339,8 +345,8 @@ sealed class MirrorForm : Form
     readonly NowPlayingMonitor _nowPlaying;
     readonly MirrorControl _mirror = new();
     readonly RadioButton[] _modeButtons;
-    static readonly string[] Modes = { "auto", "claude", "codex", "net", "music" };
-    static readonly string[] ModeLabels = { "自动", "Claude", "Codex", "网速", "音乐" };
+    static readonly string[] Modes = { "auto", "claude", "codex", "kimi", "net", "music" };
+    static readonly string[] ModeLabels = { "自动", "Claude", "Codex", "Kimi", "网速", "音乐" };
     readonly Label _statusLabel = new();
 
     readonly System.Windows.Forms.Timer _pollTimer = new() { Interval = 1000 };
@@ -525,7 +531,8 @@ sealed class MirrorForm : Form
             return;
         }
         var snap = _service.Snapshot();
-        _mirror.ShowingClaude = info.Showing != "codex";
+        _mirror.ShowingClaude = info.Showing == "claude";
+        _mirror.ShowingKimi = info.Showing == "kimi";
         if (_mirror.ShowingClaude)
         {
             var pct = snap.Claude.FiveHourPct
@@ -535,6 +542,13 @@ sealed class MirrorForm : Form
             _mirror.Line1 = "5h " + PctText(pct);
             _mirror.Line2 = "Weekly " + PctText(snap.Claude.SevenDayPct);
             _mirror.NeedsInput = snap.Claude.NeedsInput;
+        }
+        else if (_mirror.ShowingKimi)
+        {
+            _mirror.RingPct = Math.Max(snap.Kimi.FiveHourPct ?? -1, 0);
+            _mirror.Line1 = "5h " + PctText(snap.Kimi.FiveHourPct);
+            _mirror.Line2 = "Weekly " + PctText(snap.Kimi.SevenDayPct);
+            _mirror.NeedsInput = snap.Kimi.NeedsInput;
         }
         else
         {
@@ -551,9 +565,15 @@ sealed class MirrorForm : Form
 
     void EnsureSprite(DeviceInfo info)
     {
-        var slot = info.Showing == "codex" ? "codex" : "claude";
-        var w = slot == "claude" ? info.ClaudeW : info.CodexW;
-        var h = slot == "claude" ? info.ClaudeH : info.CodexH;
+        string slot;
+        int w, h;
+        switch (info.Showing)
+        {
+            case "claude": slot = "claude"; w = info.ClaudeW; h = info.ClaudeH; break;
+            case "codex": slot = "codex"; w = info.CodexW; h = info.CodexH; break;
+            case "kimi": slot = "kimi"; w = info.KimiW; h = info.KimiH; break;
+            default: return; // net/music modes have no sprite
+        }
         if (_spriteCache.TryGetValue(slot, out var cached) && cached.Rev == info.SpriteRev)
         {
             _mirror.Frames = cached.Frames;
@@ -576,7 +596,7 @@ sealed class MirrorForm : Form
             if (_spriteCache.TryGetValue(slot, out var old))
                 foreach (var f in old.Frames) f.Dispose();
             _spriteCache[slot] = (rev, frames, w, h);
-            if ((_lastInfo?.Showing == "codex" ? "codex" : "claude") == slot)
+            if (_lastInfo?.Showing == slot)
             {
                 _mirror.Frames = frames;
                 _mirror.SpriteW = w;
@@ -619,8 +639,13 @@ sealed class MirrorForm : Form
 
         if (_mirror.Frames.Count == 0) return;
         var snap = _service.Snapshot();
-        var working = _lastInfo.Showing == "codex"
-            ? snap.Codex.Status == "working" : snap.Claude.Status == "working";
+        var working = _lastInfo.Showing switch
+        {
+            "claude" => snap.Claude.Status == "working",
+            "codex" => snap.Codex.Status == "working",
+            "kimi" => snap.Kimi.Status == "working",
+            _ => false,
+        };
         if (working)
         {
             _mirror.FrameIdx = (_mirror.FrameIdx + 1) % _mirror.Frames.Count;

@@ -19,8 +19,10 @@
 #include "config.h"
 #include "img/claude_sprite.h"
 #include "img/codex_sprite.h"
+#include "img/kimi_sprite.h"
 #include "img/claude_logo.h"
 #include "img/codex_logo.h"
+#include "img/kimi_logo.h"
 
 TFT_eSPI tft = TFT_eSPI();
 ESP8266WebServer webServer(80);
@@ -38,11 +40,14 @@ ESP8266WebServer webServer(80);
 // compiled-in defaults and custom uploads share one draw path.
 const char *CLAUDE_SPRITE_FILE = "/c.bin";
 const char *CODEX_SPRITE_FILE = "/x.bin";
+const char *KIMI_SPRITE_FILE = "/k.bin";
 const char *CLAUDE_GIF_FILE = "/c.gif"; // raw upload, decoded then removed
 const char *CODEX_GIF_FILE = "/x.gif";
+const char *KIMI_GIF_FILE = "/k.gif";
 const int MAX_CUSTOM_FRAMES = 8;
 const size_t CLAUDE_FRAME_BYTES = (size_t)CLAUDE_SPRITE_W * CLAUDE_SPRITE_H * 2;
 const size_t CODEX_FRAME_BYTES = (size_t)CODEX_SPRITE_W * CODEX_SPRITE_H * 2;
+const size_t KIMI_FRAME_BYTES = (size_t)KIMI_SPRITE_W * KIMI_SPRITE_H * 2;
 
 // We never hold a whole sprite frame in RAM. Decoding a GIF needs ~24KB of
 // heap for AnimatedGIF's own buffers, which wouldn't fit alongside a static
@@ -56,6 +61,8 @@ bool claudeCustom = false;
 int claudeCustomFrames = 0;
 bool codexCustom = false;
 int codexCustomFrames = 0;
+bool kimiCustom = false;
+int kimiCustomFrames = 0;
 uint32_t spriteRev = 0; // bumped on upload/reset so the Mac mirror re-fetches
 
 const int SCREEN_CX = 120, SCREEN_CY = 120;
@@ -66,14 +73,14 @@ const unsigned long FLASH_INTERVAL_MS = 400; // "urgent" flash speed
 const unsigned long SWITCH_BOTH_MS = 2000;   // both apps working: alternate fast
 const unsigned long SWITCH_IDLE_MS = 6000;   // neither working: alternate slow
 
-enum ActiveApp { APP_CLAUDE, APP_CODEX };
+enum ActiveApp { APP_CLAUDE, APP_CODEX, APP_KIMI };
 ActiveApp currentApp = APP_CLAUDE;
 unsigned long lastSwitchMs = 0;
 
 // Display override, settable from the Mac app via POST /api/display:
 // auto = follow working status, claude/codex = pin that app on screen,
 // net/music = show Mac-side telemetry pages instead of the pet.
-enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC };
+enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_KIMI, MODE_NET, MODE_MUSIC };
 DisplayMode displayMode = MODE_AUTO;
 
 // When AUTO and the Mac reports audio playing, the screen auto-switches to the
@@ -126,6 +133,7 @@ unsigned long lastMusicPollMs = 0;
 
 int claudeFrame = 0;
 int codexFrame = 0;
+int kimiFrame = 0;
 unsigned long lastAnimMs = 0;
 
 bool flashOn = true;
@@ -155,8 +163,17 @@ struct CodexStatus {
   bool needsInput = false;
 };
 
+struct KimiStatus {
+  String status = "unknown";
+  long tokensToday = 0;
+  float fiveHourPct = -1; // kimi-code has no public quota API; kept for JSON parity
+  float sevenDayPct = -1;
+  bool needsInput = false;
+};
+
 ClaudeStatus claudeStatus;
 CodexStatus codexStatus;
+KimiStatus kimiStatus;
 
 unsigned long lastPollMs = 0;
 unsigned long lastSuccessMs = 0;
@@ -212,12 +229,27 @@ void loadCustomSpriteState() {
     if (f) f.close();
   }
 
-  Serial.printf("[sprite] claude custom=%d frames=%d | codex custom=%d frames=%d\n", claudeCustom,
-                claudeCustomFrames, codexCustom, codexCustomFrames);
+  kimiCustom = false;
+  if (LittleFS.exists(KIMI_SPRITE_FILE)) {
+    File f = LittleFS.open(KIMI_SPRITE_FILE, "r");
+    if (f && f.size() >= 1) {
+      uint8_t cnt = f.read();
+      size_t expected = 1 + (size_t)cnt * KIMI_FRAME_BYTES;
+      if (cnt > 0 && cnt <= MAX_CUSTOM_FRAMES && (size_t)f.size() == expected) {
+        kimiCustom = true;
+        kimiCustomFrames = cnt;
+      }
+    }
+    if (f) f.close();
+  }
+
+  Serial.printf("[sprite] claude custom=%d frames=%d | codex custom=%d frames=%d | kimi custom=%d frames=%d\n",
+                claudeCustom, claudeCustomFrames, codexCustom, codexCustomFrames, kimiCustom, kimiCustomFrames);
 }
 
 int claudeFrameCount() { return claudeCustom ? claudeCustomFrames : CLAUDE_SPRITE_FRAMES; }
 int codexFrameCount() { return codexCustom ? codexCustomFrames : CODEX_SPRITE_FRAMES; }
+int kimiFrameCount() { return kimiCustom ? kimiCustomFrames : KIMI_SPRITE_FRAMES; }
 
 // Draws one sprite frame centered on screen, one row at a time so we never
 // need a full-frame buffer: each row comes either from the custom LittleFS
@@ -276,7 +308,9 @@ bool bridgeStale() {
 // True when the app currently on screen is waiting on a permission/approval
 // prompt — drives the red "look now, act" border flash.
 bool currentAppNeedsInput() {
-  return currentApp == APP_CLAUDE ? claudeStatus.needsInput : codexStatus.needsInput;
+  if (currentApp == APP_CLAUDE) return claudeStatus.needsInput;
+  if (currentApp == APP_CODEX) return codexStatus.needsInput;
+  return kimiStatus.needsInput;
 }
 
 // Working vs idle is now conveyed by the sprite animation itself (moving vs
@@ -351,6 +385,11 @@ void drawCodexSprite(int frameIdx) {
                   CODEX_FRAME_BYTES);
 }
 
+void drawKimiSprite(int frameIdx) {
+  drawSpriteFrame(kimiCustom, KIMI_SPRITE_FILE, kimi_sprite_frames, frameIdx, KIMI_SPRITE_W,
+                  KIMI_SPRITE_H, KIMI_FRAME_BYTES);
+}
+
 String pctText(float pct) {
   return pct >= 0 ? String((int)pct) + "%" : "-";
 }
@@ -369,9 +408,21 @@ void drawQuotaText(float hourPct, float weekPct) {
 const int LOGO_X = 14, LOGO_Y = 18;
 
 void drawAppLogo() {
-  const uint16_t *logo = (currentApp == APP_CLAUDE) ? claude_logo_0 : codex_logo_0;
-  int w = (currentApp == APP_CLAUDE) ? CLAUDE_LOGO_W : CODEX_LOGO_W;
-  int h = (currentApp == APP_CLAUDE) ? CLAUDE_LOGO_H : CODEX_LOGO_H;
+  const uint16_t *logo;
+  int w, h;
+  if (currentApp == APP_CLAUDE) {
+    logo = claude_logo_0;
+    w = CLAUDE_LOGO_W;
+    h = CLAUDE_LOGO_H;
+  } else if (currentApp == APP_CODEX) {
+    logo = codex_logo_0;
+    w = CODEX_LOGO_W;
+    h = CODEX_LOGO_H;
+  } else {
+    logo = kimi_logo_0;
+    w = KIMI_LOGO_W;
+    h = KIMI_LOGO_H;
+  }
   for (int r = 0; r < h; r++) {
     memcpy_P(rowBuf, logo + (size_t)r * w, (size_t)w * 2);
     tft.pushImage(LOGO_X, LOGO_Y + r, w, 1, rowBuf);
@@ -394,10 +445,14 @@ void drawActiveApp() {
     drawSquareRing(claudeRingPct(), currentStatusColor());
     drawClaudeSprite(claudeFrame);
     drawQuotaText(claudeRingPct(), claudeStatus.sevenDayPct);
-  } else {
+  } else if (currentApp == APP_CODEX) {
     drawSquareRing(max(codexStatus.primaryPct, 0.0f), currentStatusColor());
     drawCodexSprite(codexFrame);
     drawQuotaText(codexStatus.primaryPct, codexStatus.weeklyPct);
+  } else {
+    drawSquareRing(max(kimiStatus.fiveHourPct, 0.0f), currentStatusColor());
+    drawKimiSprite(kimiFrame);
+    drawQuotaText(kimiStatus.fiveHourPct, kimiStatus.sevenDayPct);
   }
   drawAppLogo();
 }
@@ -407,8 +462,10 @@ void drawActiveApp() {
 void redrawRingOnly() {
   if (currentApp == APP_CLAUDE) {
     drawSquareRing(claudeRingPct(), currentStatusColor());
-  } else {
+  } else if (currentApp == APP_CODEX) {
     drawSquareRing(max(codexStatus.primaryPct, 0.0f), currentStatusColor());
+  } else {
+    drawSquareRing(max(kimiStatus.fiveHourPct, 0.0f), currentStatusColor());
   }
 }
 
@@ -417,6 +474,10 @@ void redrawRingOnly() {
 //   - exactly one app working       -> that app, immediately
 //   - both working                  -> alternate every SWITCH_BOTH_MS (2s)
 //   - neither working               -> alternate slowly (SWITCH_IDLE_MS)
+static ActiveApp nextAppInCycle(ActiveApp app) {
+  return (app == APP_CLAUDE) ? APP_CODEX : (app == APP_CODEX) ? APP_KIMI : APP_CLAUDE;
+}
+
 bool updateActiveApp() {
   ActiveApp desired = currentApp;
 
@@ -424,22 +485,43 @@ bool updateActiveApp() {
     desired = APP_CLAUDE;
   } else if (displayMode == MODE_CODEX) {
     desired = APP_CODEX;
-  } else if (claudeStatus.needsInput && !codexStatus.needsInput) {
-    desired = APP_CLAUDE; // approval prompt wins the screen
-  } else if (codexStatus.needsInput && !claudeStatus.needsInput) {
-    desired = APP_CODEX;
+  } else if (displayMode == MODE_KIMI) {
+    desired = APP_KIMI;
   } else {
-    bool claudeWorking = claudeStatus.status == "working";
-    bool codexWorking = codexStatus.status == "working";
-    if (claudeWorking && !codexWorking) {
-      desired = APP_CLAUDE;
-    } else if (codexWorking && !claudeWorking) {
-      desired = APP_CODEX;
+    // approval prompt: exactly one app waiting for input wins the screen
+    int inputCount = 0;
+    if (claudeStatus.needsInput) inputCount++;
+    if (codexStatus.needsInput) inputCount++;
+    if (kimiStatus.needsInput) inputCount++;
+    if (inputCount == 1) {
+      if (claudeStatus.needsInput) desired = APP_CLAUDE;
+      else if (codexStatus.needsInput) desired = APP_CODEX;
+      else desired = APP_KIMI;
     } else {
-      unsigned long interval = (claudeWorking && codexWorking) ? SWITCH_BOTH_MS : SWITCH_IDLE_MS;
-      if (millis() - lastSwitchMs >= interval) {
-        lastSwitchMs = millis();
-        desired = (currentApp == APP_CLAUDE) ? APP_CODEX : APP_CLAUDE;
+      bool claudeWorking = claudeStatus.status == "working";
+      bool codexWorking = codexStatus.status == "working";
+      bool kimiWorking = kimiStatus.status == "working";
+      int workingCount = (claudeWorking ? 1 : 0) + (codexWorking ? 1 : 0) + (kimiWorking ? 1 : 0);
+
+      if (workingCount == 1) {
+        if (claudeWorking) desired = APP_CLAUDE;
+        else if (codexWorking) desired = APP_CODEX;
+        else desired = APP_KIMI;
+      } else {
+        unsigned long interval = (workingCount > 1) ? SWITCH_BOTH_MS : SWITCH_IDLE_MS;
+        if (millis() - lastSwitchMs >= interval) {
+          lastSwitchMs = millis();
+          // rotate through the relevant set until we land on a member
+          ActiveApp nextApp = nextAppInCycle(currentApp);
+          if (workingCount > 1) {
+            while ((nextApp == APP_CLAUDE && !claudeWorking) ||
+                   (nextApp == APP_CODEX && !codexWorking) ||
+                   (nextApp == APP_KIMI && !kimiWorking)) {
+              nextApp = nextAppInCycle(nextApp);
+            }
+          }
+          desired = nextApp;
+        }
       }
     }
   }
@@ -869,6 +951,16 @@ bool parseStatusJson(const String &payload) {
     codexStatus.weeklyResetMin = x["weekly_reset_min"] | -1;
     codexStatus.needsInput = x["needs_input"] | false;
   }
+
+  JsonObject k = doc["kimi"];
+  if (!k.isNull()) {
+    kimiStatus.status = k["status"] | "unknown";
+    kimiStatus.tokensToday = k["tokens_today"] | 0;
+    kimiStatus.fiveHourPct = k["five_hour_pct"] | -1.0;
+    kimiStatus.sevenDayPct = k["seven_day_pct"] | -1.0;
+    kimiStatus.needsInput = k["needs_input"] | false;
+  }
+
   statusMusicPlaying = doc["music_playing"] | false;
   return true;
 }
@@ -878,7 +970,7 @@ bool parseStatusJson(const String &payload) {
 // music page.
 DisplayMode effectiveMode() {
   if (displayMode == MODE_AUTO) {
-    if (claudeStatus.needsInput || codexStatus.needsInput) return MODE_AUTO;
+    if (claudeStatus.needsInput || codexStatus.needsInput || kimiStatus.needsInput) return MODE_AUTO;
     if (statusMusicPlaying) return MODE_MUSIC;
   }
   return displayMode;
@@ -906,15 +998,17 @@ void pollBridge() {
     if (parseStatusJson(payload)) {
       lastSuccessMs = millis();
       everPolled = true;
-      Serial.printf("[bridge] claude=%s tok=%ld | codex=%s tok=%ld primary=%.0f%%\n",
+      Serial.printf("[bridge] claude=%s tok=%ld | codex=%s tok=%ld primary=%.0f%% | kimi=%s tok=%ld\n",
                     claudeStatus.status.c_str(), claudeStatus.tokensToday,
-                    codexStatus.status.c_str(), codexStatus.tokensToday, codexStatus.primaryPct);
+                    codexStatus.status.c_str(), codexStatus.tokensToday, codexStatus.primaryPct,
+                    kimiStatus.status.c_str(), kimiStatus.tokensToday);
     } else {
       Serial.println("[bridge] JSON parse failed");
     }
   } else {
     claudeStatus.status = "offline";
     codexStatus.status = "offline";
+    kimiStatus.status = "offline";
   }
   http.end();
   DisplayMode eff = effectiveMode();
@@ -965,7 +1059,7 @@ void handleRoot() {
           "立刻替换动画，无需重新编译或烧录。GIF 太大可能因内存不足解码失败，换小一点的即可。</p>";
   html += "<form id='gifForm' method='POST' enctype='multipart/form-data' onsubmit='return setGifAction()'>";
   html += "<label>角色</label>";
-  html += "<select id='gifTarget'><option value='claude'>Claude</option><option value='codex'>Codex</option></select>";
+  html += "<select id='gifTarget'><option value='claude'>Claude</option><option value='codex'>Codex</option><option value='kimi'>Kimi</option></select>";
   html += "<label>GIF 文件</label><input type='file' name='file' accept='.gif' required>";
   html += "<button type='submit'>上传并应用</button>";
   html += "</form>";
@@ -982,6 +1076,8 @@ void handleRoot() {
   html += "<tr><td>Codex</td><td>" + htmlEscape(codexStatus.status) + ", " +
           formatTokens(codexStatus.tokensToday) + " tok, 5h " +
           (codexStatus.primaryPct >= 0 ? String(codexStatus.primaryPct, 0) + "%" : "?") + "</td></tr>";
+  html += "<tr><td>Kimi</td><td>" + htmlEscape(kimiStatus.status) + ", " +
+          formatTokens(kimiStatus.tokensToday) + " tok</td></tr>";
   html += "</table>";
 
   html += "<form method='POST' action='/reset-wifi' onsubmit=\"return confirm('清除 WiFi "
@@ -1008,6 +1104,7 @@ void handleSave() {
 const char *displayModeName(DisplayMode m) {
   if (m == MODE_CLAUDE) return "claude";
   if (m == MODE_CODEX) return "codex";
+  if (m == MODE_KIMI) return "kimi";
   if (m == MODE_NET) return "net";
   if (m == MODE_MUSIC) return "music";
   return "auto";
@@ -1021,7 +1118,7 @@ void handleApiInfo() {
   doc["mode"] = displayModeName(displayMode);           // configured mode
   doc["effective"] = displayModeName(effectiveMode());   // what's on screen now
   doc["music_playing"] = statusMusicPlaying;
-  doc["showing"] = (currentApp == APP_CLAUDE) ? "claude" : "codex";
+  doc["showing"] = (currentApp == APP_CLAUDE) ? "claude" : (currentApp == APP_CODEX) ? "codex" : "kimi";
   doc["last_update_s"] = everPolled ? (long)((millis() - lastSuccessMs) / 1000) : -1;
   doc["sprite_rev"] = spriteRev;
   doc["fw"] = FW_VERSION;
@@ -1035,6 +1132,11 @@ void handleApiInfo() {
   x["custom_sprite"] = codexCustom;
   x["w"] = CODEX_SPRITE_W;
   x["h"] = CODEX_SPRITE_H;
+  JsonObject k = doc["kimi"].to<JsonObject>();
+  k["status"] = kimiStatus.status;
+  k["custom_sprite"] = kimiCustom;
+  k["w"] = KIMI_SPRITE_W;
+  k["h"] = KIMI_SPRITE_H;
   String out;
   serializeJson(doc, out);
   webServer.send(200, "application/json", out);
@@ -1045,10 +1147,11 @@ void handleApiDisplay() {
   if (mode == "auto") displayMode = MODE_AUTO;
   else if (mode == "claude") displayMode = MODE_CLAUDE;
   else if (mode == "codex") displayMode = MODE_CODEX;
+  else if (mode == "kimi") displayMode = MODE_KIMI;
   else if (mode == "net") displayMode = MODE_NET;
   else if (mode == "music") displayMode = MODE_MUSIC;
   else {
-    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music");
+    webServer.send(400, "text/plain", "mode must be auto|claude|codex|kimi|net|music");
     return;
   }
   Serial.printf("[api] display mode = %s\n", mode.c_str());
@@ -1083,8 +1186,20 @@ void handleApiBridge() {
 // as the custom .bin: [1 byte frame count][RGB565 frames...]. Lets the Mac
 // app mirror exactly what the device is showing (custom upload or built-in).
 void handleSpriteRaw(ActiveApp slot) {
-  bool custom = (slot == APP_CLAUDE) ? claudeCustom : codexCustom;
-  const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
+  bool custom;
+  const char *binPath;
+  int frames, w, h;
+  const uint16_t *const *arr;
+  if (slot == APP_CLAUDE) {
+    custom = claudeCustom; binPath = CLAUDE_SPRITE_FILE;
+    frames = CLAUDE_SPRITE_FRAMES; w = CLAUDE_SPRITE_W; h = CLAUDE_SPRITE_H; arr = claude_sprite_frames;
+  } else if (slot == APP_CODEX) {
+    custom = codexCustom; binPath = CODEX_SPRITE_FILE;
+    frames = CODEX_SPRITE_FRAMES; w = CODEX_SPRITE_W; h = CODEX_SPRITE_H; arr = codex_sprite_frames;
+  } else {
+    custom = kimiCustom; binPath = KIMI_SPRITE_FILE;
+    frames = KIMI_SPRITE_FRAMES; w = KIMI_SPRITE_W; h = KIMI_SPRITE_H; arr = kimi_sprite_frames;
+  }
   if (custom) {
     File f = LittleFS.open(binPath, "r");
     if (f) {
@@ -1093,10 +1208,6 @@ void handleSpriteRaw(ActiveApp slot) {
       return;
     }
   }
-  int frames = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FRAMES : CODEX_SPRITE_FRAMES;
-  int w = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_W : CODEX_SPRITE_W;
-  int h = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_H : CODEX_SPRITE_H;
-  const uint16_t *const *arr = (slot == APP_CLAUDE) ? claude_sprite_frames : codex_sprite_frames;
   size_t frameBytes = (size_t)w * h * 2;
   webServer.setContentLength(1 + (size_t)frames * frameBytes);
   webServer.send(200, "application/octet-stream", "");
@@ -1110,12 +1221,16 @@ void handleSpriteRaw(ActiveApp slot) {
 
 // Removes a custom sprite so the compiled-in default animation comes back.
 void handleSpriteReset(ActiveApp slot) {
-  const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
+  const char *binPath;
+  if (slot == APP_CLAUDE) binPath = CLAUDE_SPRITE_FILE;
+  else if (slot == APP_CODEX) binPath = CODEX_SPRITE_FILE;
+  else binPath = KIMI_SPRITE_FILE;
   LittleFS.remove(binPath);
   spriteRev++;
   loadCustomSpriteState();
   if (slot == APP_CLAUDE) claudeFrame = 0;
-  else codexFrame = 0;
+  else if (slot == APP_CODEX) codexFrame = 0;
+  else kimiFrame = 0;
   if (currentApp == slot) drawActiveApp();
   webServer.send(200, "text/plain", "ok");
 }
@@ -1331,10 +1446,16 @@ void handleSpriteUploadChunk(const char *gifPath) {
 }
 
 void handleSpriteUploadDone(ActiveApp slot) {
-  const char *gifPath = (slot == APP_CLAUDE) ? CLAUDE_GIF_FILE : CODEX_GIF_FILE;
-  const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
-  int tw = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_W : CODEX_SPRITE_W;
-  int th = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_H : CODEX_SPRITE_H;
+  const char *gifPath;
+  const char *binPath;
+  int tw, th;
+  if (slot == APP_CLAUDE) {
+    gifPath = CLAUDE_GIF_FILE; binPath = CLAUDE_SPRITE_FILE; tw = CLAUDE_SPRITE_W; th = CLAUDE_SPRITE_H;
+  } else if (slot == APP_CODEX) {
+    gifPath = CODEX_GIF_FILE; binPath = CODEX_SPRITE_FILE; tw = CODEX_SPRITE_W; th = CODEX_SPRITE_H;
+  } else {
+    gifPath = KIMI_GIF_FILE; binPath = KIMI_SPRITE_FILE; tw = KIMI_SPRITE_W; th = KIMI_SPRITE_H;
+  }
 
   bool ok = decodeGifToBin(gifPath, binPath, tw, th);
   LittleFS.remove(gifPath); // temp raw gif no longer needed once decoded
@@ -1342,7 +1463,8 @@ void handleSpriteUploadDone(ActiveApp slot) {
   spriteRev++;
   loadCustomSpriteState();
   if (slot == APP_CLAUDE) claudeFrame = 0;
-  else codexFrame = 0;
+  else if (slot == APP_CODEX) codexFrame = 0;
+  else kimiFrame = 0;
   if (currentApp == slot) drawActiveApp();
 
   if (ok) {
@@ -1363,14 +1485,19 @@ void setupWebServer() {
   webServer.on("/api/bridge", HTTP_POST, handleApiBridge);
   webServer.on("/sprite/claude/reset", HTTP_POST, []() { handleSpriteReset(APP_CLAUDE); });
   webServer.on("/sprite/codex/reset", HTTP_POST, []() { handleSpriteReset(APP_CODEX); });
+  webServer.on("/sprite/kimi/reset", HTTP_POST, []() { handleSpriteReset(APP_KIMI); });
   webServer.on("/sprite/claude/raw", HTTP_GET, []() { handleSpriteRaw(APP_CLAUDE); });
   webServer.on("/sprite/codex/raw", HTTP_GET, []() { handleSpriteRaw(APP_CODEX); });
+  webServer.on("/sprite/kimi/raw", HTTP_GET, []() { handleSpriteRaw(APP_KIMI); });
   webServer.on(
       "/sprite/claude", HTTP_POST, []() { handleSpriteUploadDone(APP_CLAUDE); },
       []() { handleSpriteUploadChunk(CLAUDE_GIF_FILE); });
   webServer.on(
       "/sprite/codex", HTTP_POST, []() { handleSpriteUploadDone(APP_CODEX); },
       []() { handleSpriteUploadChunk(CODEX_GIF_FILE); });
+  webServer.on(
+      "/sprite/kimi", HTTP_POST, []() { handleSpriteUploadDone(APP_KIMI); },
+      []() { handleSpriteUploadChunk(KIMI_GIF_FILE); });
   webServer.begin();
   Serial.printf("[web] admin server listening on http://%s/\n", WiFi.localIP().toString().c_str());
 }
@@ -1449,12 +1576,16 @@ void loop() {
       lastAnimMs = nowMs;
       bool claudeWorking = claudeStatus.status == "working";
       bool codexWorking = codexStatus.status == "working";
+      bool kimiWorking = kimiStatus.status == "working";
       if (currentApp == APP_CLAUDE && claudeWorking) {
         claudeFrame = (claudeFrame + 1) % claudeFrameCount();
         drawClaudeSprite(claudeFrame);
       } else if (currentApp == APP_CODEX && codexWorking) {
         codexFrame = (codexFrame + 1) % codexFrameCount();
         drawCodexSprite(codexFrame);
+      } else if (currentApp == APP_KIMI && kimiWorking) {
+        kimiFrame = (kimiFrame + 1) % kimiFrameCount();
+        drawKimiSprite(kimiFrame);
       }
     }
 

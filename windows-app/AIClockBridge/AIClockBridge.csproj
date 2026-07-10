@@ -27,6 +27,7 @@
     <EmbeddedResource Include="Assets\claude-logo.png" />
     <EmbeddedResource Include="Assets\codex-logo.png" />
     <EmbeddedResource Include="Assets\happy-mac.png" />
+    <EmbeddedResource Include="Assets\kimi-logo.png" />
   </ItemGroup>
 
 </Project>

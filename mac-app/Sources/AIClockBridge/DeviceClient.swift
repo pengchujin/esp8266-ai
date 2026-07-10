@@ -15,8 +15,10 @@ struct DeviceInfo {
     var spriteRev = 0       // bumped by the device on animation change
     var claudeCustomSprite = false
     var codexCustomSprite = false
+    var kimiCustomSprite = false
     var claudeW = 111, claudeH = 120
     var codexW = 120, codexH = 120
+    var kimiW = 120, kimiH = 120
 }
 
 final class DeviceClient {
@@ -65,12 +67,16 @@ final class DeviceClient {
                 info.spriteRev = (obj["sprite_rev"] as? NSNumber)?.intValue ?? 0
                 let claude = obj["claude"] as? [String: Any]
                 let codex = obj["codex"] as? [String: Any]
+                let kimi = obj["kimi"] as? [String: Any]
                 info.claudeCustomSprite = claude?["custom_sprite"] as? Bool ?? false
                 info.codexCustomSprite = codex?["custom_sprite"] as? Bool ?? false
+                info.kimiCustomSprite = kimi?["custom_sprite"] as? Bool ?? false
                 info.claudeW = (claude?["w"] as? NSNumber)?.intValue ?? 111
                 info.claudeH = (claude?["h"] as? NSNumber)?.intValue ?? 120
                 info.codexW = (codex?["w"] as? NSNumber)?.intValue ?? 120
                 info.codexH = (codex?["h"] as? NSNumber)?.intValue ?? 120
+                info.kimiW = (kimi?["w"] as? NSNumber)?.intValue ?? 120
+                info.kimiH = (kimi?["h"] as? NSNumber)?.intValue ?? 120
                 result = .success(info)
             } else {
                 result = .failure(Self.badResponseError)

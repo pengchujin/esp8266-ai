@@ -18,6 +18,7 @@ sealed class TrayAppContext : ApplicationContext
 
     readonly ToolStripMenuItem _claudeUsageItem = new("Claude …") { Enabled = false };
     readonly ToolStripMenuItem _codexUsageItem = new("Codex …") { Enabled = false };
+    readonly ToolStripMenuItem _kimiUsageItem = new("Kimi …") { Enabled = false };
     readonly ToolStripMenuItem _deviceInfoItem = new("设备：未设置") { Enabled = false };
     readonly Dictionary<string, ToolStripMenuItem> _modeItems = new();
 
@@ -68,6 +69,7 @@ sealed class TrayAppContext : ApplicationContext
     {
         _menu.Items.Add(_claudeUsageItem);
         _menu.Items.Add(_codexUsageItem);
+        _menu.Items.Add(_kimiUsageItem);
         _menu.Items.Add(new ToolStripSeparator());
 
         _menu.Items.Add(_deviceInfoItem);
@@ -79,7 +81,8 @@ sealed class TrayAppContext : ApplicationContext
         foreach (var (title, mode) in new[]
         {
             ("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
-            ("固定 Codex", "codex"), ("网速曲线", "net"), ("音乐播放", "music"),
+            ("固定 Codex", "codex"), ("固定 Kimi", "kimi"),
+            ("网速曲线", "net"), ("音乐播放", "music"),
         })
         {
             var item = new ToolStripMenuItem(title);
@@ -92,7 +95,7 @@ sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(MakeItem("更换桌宠动画…（petdex）", (_, _) => OpenPetPicker()));
 
         var resetMenu = new ToolStripMenuItem("恢复默认动画");
-        foreach (var (title, slot) in new[] { ("Claude 恢复默认", "claude"), ("Codex 恢复默认", "codex") })
+        foreach (var (title, slot) in new[] { ("Claude 恢复默认", "claude"), ("Codex 恢复默认", "codex"), ("Kimi 恢复默认", "kimi") })
         {
             var item = new ToolStripMenuItem(title);
             item.Click += async (_, _) => await ResetSprite(slot);
@@ -130,6 +133,7 @@ sealed class TrayAppContext : ApplicationContext
     {
         _claudeUsageItem.Text = UsageLine("Claude", _usage.Claude, "7天");
         _codexUsageItem.Text = UsageLine("Codex", _usage.Codex, "周");
+        _kimiUsageItem.Text = UsageLine("Kimi", _usage.Kimi, "7天");
     }
 
     static string UsageLine(string name, ProviderUsage u, string weeklyLabel)
@@ -191,10 +195,11 @@ sealed class TrayAppContext : ApplicationContext
         {
             info.ClaudeCustomSprite ? "C:自定义" : "C:默认",
             info.CodexCustomSprite ? "X:自定义" : "X:默认",
+            info.KimiCustomSprite ? "K:自定义" : "K:默认",
         };
         var showing = info.Mode == "net" ? "网速"
             : info.Mode == "music" ? "音乐"
-            : (info.Showing == "claude" ? "Claude" : "Codex");
+            : (info.Showing == "claude" ? "Claude" : info.Showing == "kimi" ? "Kimi" : "Codex");
         _deviceInfoItem.Text =
             $"设备：{info.Ip} · 正在显示 {showing} · {string.Join(" ", sprites)}";
         foreach (var (mode, item) in _modeItems) item.Checked = mode == info.Mode;

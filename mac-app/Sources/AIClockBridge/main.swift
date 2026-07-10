@@ -8,7 +8,12 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--test-pet" {
     let slug = CommandLine.arguments[2]
     let slot = CommandLine.arguments[3]
     if CommandLine.arguments.count >= 5 { DeviceClient.host = CommandLine.arguments[4] }
-    let size = slot == "claude" ? (w: 111, h: 120) : (w: 120, h: 120)
+    let size: (w: Int, h: Int)
+    switch slot {
+    case "claude": size = (w: 111, h: 120)
+    case "kimi": size = (w: 120, h: 120)
+    default: size = (w: 120, h: 120) // codex
+    }
     let state = PetdexService.states.first { $0.id == "running" }!
     PetdexService.loadManifest { result in
         guard case let .success(pets) = result, let pet = pets.first(where: { $0.slug == slug }) else {

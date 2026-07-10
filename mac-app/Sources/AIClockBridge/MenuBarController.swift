@@ -14,6 +14,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     private let claudeUsageItem = NSMenuItem(title: "Claude …", action: nil, keyEquivalent: "")
     private let codexUsageItem = NSMenuItem(title: "Codex …", action: nil, keyEquivalent: "")
+    private let kimiUsageItem = NSMenuItem(title: "Kimi …", action: nil, keyEquivalent: "")
     private let deviceInfoItem = NSMenuItem(title: "设备：未设置", action: nil, keyEquivalent: "")
     private var modeItems: [String: NSMenuItem] = [:]
 
@@ -67,8 +68,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
         claudeUsageItem.isEnabled = false
         codexUsageItem.isEnabled = false
+        kimiUsageItem.isEnabled = false
         menu.addItem(claudeUsageItem)
         menu.addItem(codexUsageItem)
+        menu.addItem(kimiUsageItem)
         menu.addItem(.separator())
 
         deviceInfoItem.isEnabled = false
@@ -80,8 +83,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
         let displayMenu = NSMenu()
         for (title, mode) in [("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
-                              ("固定 Codex", "codex"), ("网速曲线", "net"),
-                              ("音乐播放", "music")] {
+                              ("固定 Codex", "codex"), ("固定 Kimi", "kimi"),
+                              ("网速曲线", "net"), ("音乐播放", "music")] {
             let item = NSMenuItem(title: title, action: #selector(setDisplayMode(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = mode
@@ -95,7 +98,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(makeItem("更换桌宠动画…（petdex）", #selector(openPetPicker)))
 
         let resetMenu = NSMenu()
-        for (title, slot) in [("Claude 恢复默认", "claude"), ("Codex 恢复默认", "codex")] {
+        for (title, slot) in [("Claude 恢复默认", "claude"), ("Codex 恢复默认", "codex"),
+                              ("Kimi 恢复默认", "kimi")] {
             let item = NSMenuItem(title: title, action: #selector(resetSprite(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = slot
@@ -130,6 +134,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private func refreshUsageLines() {
         claudeUsageItem.title = Self.usageLine(name: "Claude", u: usage.claude, weeklyLabel: "7天")
         codexUsageItem.title = Self.usageLine(name: "Codex", u: usage.codex, weeklyLabel: "周")
+        kimiUsageItem.title = Self.usageLine(name: "Kimi", u: usage.kimi, weeklyLabel: "7天")
     }
 
     private static func usageLine(name: String, u: ProviderUsage, weeklyLabel: String) -> String {
@@ -167,10 +172,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             switch result {
             case let .success(info):
                 let sprites = [info.claudeCustomSprite ? "C:自定义" : "C:默认",
-                               info.codexCustomSprite ? "X:自定义" : "X:默认"]
+                               info.codexCustomSprite ? "X:自定义" : "X:默认",
+                               info.kimiCustomSprite ? "K:自定义" : "K:默认"]
                 let showing = info.mode == "net" ? "网速"
                     : info.mode == "music" ? "音乐"
-                    : (info.showing == "claude" ? "Claude" : "Codex")
+                    : (info.showing == "claude" ? "Claude" : info.showing == "kimi" ? "Kimi" : "Codex")
                 self.deviceInfoItem.title =
                     "设备：\(info.ip) · 正在显示 \(showing) · \(sprites.joined(separator: " "))"
                 for (mode, item) in self.modeItems { item.state = mode == info.mode ? .on : .off }
