@@ -1,16 +1,21 @@
 import AppKit
+import Sparkle
 
 // Menu-bar item: a retro Macintosh icon (drawn in code, template so it adapts
 // to light/dark menu bars). Left click opens a live mirror of the ESP8266
 // screen (MirrorPopover); right click opens the control menu with usage
 // meters and device remote control. No quota text lives in the bar itself.
-final class MenuBarController: NSObject, NSMenuDelegate {
+final class MenuBarController: NSObject, NSMenuDelegate, SPUUpdaterDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let service: StatusService
     private let usage: UsageFetcher
     private let port: UInt16
     private let controlMenu = NSMenu()
     private let mirrorPopover: MirrorPopoverController
+    var updaterController: SPUStandardUpdaterController!
+    private lazy var aboutController = AboutWindowController { [weak self] in
+        self?.updaterController.checkForUpdates(nil)
+    }
 
     private let claudeUsageItem = NSMenuItem(title: "Claude …", action: nil, keyEquivalent: "")
     private let codexUsageItem = NSMenuItem(title: "Codex …", action: nil, keyEquivalent: "")
@@ -32,6 +37,20 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             button.target = self
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.toolTip = "AIClockBridge \(AppVersion.display)"
+        }
+
+        // Debug/testing helper: launch with AICLOCK_CHECK_UPDATE_NOW=1 to
+        // trigger the Sparkle "Check for Updates" window shortly after startup.
+        let shouldAutoCheck = ProcessInfo.processInfo.environment["AICLOCK_CHECK_UPDATE_NOW"] == "1"
+            || FileManager.default.fileExists(atPath: "\(NSHomeDirectory())/Library/Application Support/AIClockBridge/.check_update_now")
+        if shouldAutoCheck {
+            FileHandle.standardError.write(Data("[updater] auto-check flag set, will check soon\n".utf8))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+                guard let self = self else { return }
+                FileHandle.standardError.write(Data("[updater] triggering SPUUpdater.checkForUpdates()\n".utf8))
+                self.updaterController.updater.checkForUpdates()
+            }
         }
     }
 
@@ -110,6 +129,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(resetItem)
 
         menu.addItem(makeItem("把本机设为设备桥接", #selector(pointBridgeHere)))
+        menu.addItem(.separator())
+        menu.addItem(makeItem("检查更新…", #selector(checkForUpdates)))
+        menu.addItem(makeItem("关于 AIClockBridge", #selector(showAbout)))
+
+        let versionItem = NSMenuItem(title: "版本 \(AppVersion.display)", action: nil, keyEquivalent: "")
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
+
         menu.addItem(.separator())
         menu.addItem(makeItem("刷新", #selector(refreshAction), key: "r"))
         menu.addItem(makeItem("桥接服务地址", #selector(showAddress)))
@@ -230,6 +257,36 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         usage.refresh()
         refreshUsageLines()
         refreshDeviceSection()
+    }
+
+    @objc private func checkForUpdates() {
+        updaterController.checkForUpdates(nil)
+    }
+
+    // MARK: - SPUUpdaterDelegate
+
+    func updater(_ updater: SPUUpdater, didFinishLoading appcast: SUAppcast) {
+        FileHandle.standardError.write(Data("[updater] didFinishLoading appcast\n".utf8))
+    }
+
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        FileHandle.standardError.write(Data("[updater] didFindValidUpdate: \(item.displayVersionString)\n".utf8))
+    }
+
+    func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
+        FileHandle.standardError.write(Data("[updater] updaterDidNotFindUpdate\n".utf8))
+    }
+
+    func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+        FileHandle.standardError.write(Data("[updater] didAbortWithError: \(error.localizedDescription)\n".utf8))
+    }
+
+    func updater(_ updater: SPUUpdater, failedToLoadAppcastWithError error: Error) {
+        FileHandle.standardError.write(Data("[updater] failedToLoadAppcastWithError: \(error.localizedDescription)\n".utf8))
+    }
+
+    @objc private func showAbout() {
+        aboutController.show()
     }
 
     @objc private func setDeviceAddress() {

@@ -929,11 +929,7 @@ void setupWiFi() {
   Serial.printf("[wifi] bridge host = '%s'\n", bridgeHost.c_str());
 }
 
-bool parseStatusJson(const String &payload) {
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, payload);
-  if (err) return false;
-
+bool parseStatusJson(JsonDocument &doc) {
   JsonObject c = doc["claude"];
   if (!c.isNull()) {
     claudeStatus.status = c["status"] | "unknown";
@@ -998,8 +994,9 @@ void pollBridge() {
   int code = http.GET();
   Serial.printf("[bridge] GET %s -> %d\n", url.c_str(), code);
   if (code == HTTP_CODE_OK) {
-    String payload = http.getString();
-    if (parseStatusJson(payload)) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, *http.getStreamPtr());
+    if (!err && parseStatusJson(doc)) {
       lastSuccessMs = millis();
       everPolled = true;
       Serial.printf("[bridge] claude=%s tok=%ld | codex=%s tok=%ld primary=%.0f%% | kimi=%s tok=%ld\n",
@@ -1007,7 +1004,7 @@ void pollBridge() {
                     codexStatus.status.c_str(), codexStatus.tokensToday, codexStatus.primaryPct,
                     kimiStatus.status.c_str(), kimiStatus.tokensToday);
     } else {
-      Serial.println("[bridge] JSON parse failed");
+      Serial.printf("[bridge] JSON parse failed: %s\n", err.c_str());
     }
   } else {
     claudeStatus.status = "offline";

@@ -1,0 +1,14 @@
+.build/
+dist/
+
+# Local Ed25519 signing keys and configuration (never commit)
+# The entire update-keys directory stays local: private key, seed, and public key.
+update-keys/
+
+# Vendored Sparkle framework (downloaded by build script)
+Vendor/
+
+# macOS / Xcode
+.DS_Store
+*.xcuserstate
+xcuserdata/

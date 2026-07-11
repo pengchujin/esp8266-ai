@@ -10,6 +10,7 @@ final class HTTPServer {
     private let routes: [String: () -> Data]
     private let binaryRoutes: [String: () -> Data]
     private let postRoutes: [String: (Data) -> Data]
+    private let staticRoots: [String: String] // prefix -> local directory
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "aiclock.http")
 
@@ -18,12 +19,13 @@ final class HTTPServer {
     /// the device's LAN address without any scanning.
     var onRequest: ((String, String) -> Void)?
 
-    init(port: UInt16, routes: [String: () -> Data], binaryRoutes: [String: () -> Data] = [:],
-         postRoutes: [String: (Data) -> Data] = [:]) {
+    init(port: UInt16, routes: [String: () -> Data] = [:], binaryRoutes: [String: () -> Data] = [:],
+         postRoutes: [String: (Data) -> Data] = [:], staticRoots: [String: String] = [:]) {
         self.port = NWEndpoint.Port(rawValue: port)!
         self.routes = routes
         self.binaryRoutes = binaryRoutes
         self.postRoutes = postRoutes
+        self.staticRoots = staticRoots
     }
 
     func start() throws {
@@ -38,6 +40,34 @@ final class HTTPServer {
     private func accept(_ conn: NWConnection) {
         conn.start(queue: queue)
         receive(conn, buffer: Data())
+    }
+
+    /// Serves files from configured local directories. The first matching prefix
+    /// wins; the remainder of the path is appended to the directory. Only
+    /// regular files inside the directory are served (no traversal).
+    private func staticFile(for path: String) -> (data: Data, type: String)? {
+        for (prefix, root) in staticRoots {
+            guard path.hasPrefix(prefix) else { continue }
+            let sub = String(path.dropFirst(prefix.count))
+            guard !sub.isEmpty, !sub.contains("..") else { continue }
+            let file = URL(fileURLWithPath: root).appendingPathComponent(sub)
+            let base = URL(fileURLWithPath: root).standardizedFileURL.path
+            let resolved = file.standardizedFileURL.path
+            guard resolved.hasPrefix(base) else { continue }
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: resolved, isDirectory: &isDir),
+                  !isDir.boolValue,
+                  let data = FileManager.default.contents(atPath: resolved) else { continue }
+            let ext = URL(fileURLWithPath: resolved).pathExtension.lowercased()
+            let type: String
+            switch ext {
+            case "xml": type = "application/xml"
+            case "zip": type = "application/zip"
+            default: type = "application/octet-stream"
+            }
+            return (data, type)
+        }
+        return nil
     }
 
     private func receive(_ conn: NWConnection, buffer: Data) {
@@ -103,6 +133,10 @@ final class HTTPServer {
             body = provider()
             statusLine = body.isEmpty ? "404 Not Found" : "200 OK"
             contentType = "application/octet-stream"
+        } else if method == "GET", let (fileData, fileType) = staticFile(for: clean) {
+            body = fileData
+            statusLine = "200 OK"
+            contentType = fileType
         } else {
             body = Data("not found".utf8)
             statusLine = "404 Not Found"

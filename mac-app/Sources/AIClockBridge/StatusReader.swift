@@ -243,16 +243,34 @@ final class StatusService {
         Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
     }
 
-    /// Lossy UTF-8 read (matches Python's errors="ignore") split into lines.
-    // Byte-level line split: session logs get large, and decoding the whole
-    // file to a Swift String just to run the Unicode-correct String.contains on
-    // every line was pathologically slow (multi-second scans, pegged a core).
-    // Splitting the raw bytes and filtering with Data.range(of:) stays on UTF-8
-    // and is orders of magnitude faster.
-    private func readLineData(_ url: URL) -> [Data]? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        let newline: UInt8 = 0x0A
-        return data.split(separator: newline, omittingEmptySubsequences: true).map { Data($0) }
+    /// Streams a file line-by-line (split on '\n') and calls `handler` with
+    /// each line's raw bytes. Stops early if `handler` returns false. Returns
+    /// false if the file could not be opened/read, so callers can skip caching
+    /// that file for this scan. This avoids loading a whole multi-megabyte
+    /// JSONL into memory at once.
+    @discardableResult
+    private func streamLineData(_ url: URL, handler: (Data) -> Bool) -> Bool {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? fh.close() }
+        var buffer = Data()
+        let chunkSize = 64 * 1024
+        while true {
+            let chunk = fh.readData(ofLength: chunkSize)
+            if chunk.isEmpty { break }
+            buffer.append(chunk)
+            while let range = buffer.range(of: Data([0x0A])) {
+                let line = buffer.subdata(in: 0..<range.lowerBound)
+                if !handler(line) { return true }
+                buffer.removeSubrange(0..<range.upperBound)
+            }
+            if buffer.count > chunkSize * 2 {
+                // Line longer than 128 KB: flush what we have to avoid unbounded growth.
+                if !handler(buffer) { return true }
+                buffer.removeAll()
+            }
+        }
+        if !buffer.isEmpty { _ = handler(buffer) }
+        return true
     }
 
     private func intVal(_ any: Any?) -> Int {
@@ -285,7 +303,8 @@ final class StatusService {
                 if let c = claudeCache[path], c.mtime == mtime {
                     parsed = (c.tokens, c.epochs)
                 } else {
-                    parsed = parseClaudeFile(url, todayStart: todayStart)
+                    guard let p = parseClaudeFile(url, todayStart: todayStart) else { continue }
+                    parsed = p
                     claudeCache[path] = (mtime, parsed.tokens, parsed.epochs)
                 }
                 tokensToday += parsed.tokens
@@ -306,21 +325,23 @@ final class StatusService {
 
     /// Parse one Claude jsonl: today's token total + every today entry's epoch
     /// (epochs feed the rolling 5h session window). Only called on new/changed files.
-    private func parseClaudeFile(_ url: URL, todayStart: Double) -> (tokens: Int, epochs: [Double]) {
-        guard let lines = readLineData(url) else { return (0, []) }
+    /// Returns nil when the file can't be read so the caller can skip caching.
+    private func parseClaudeFile(_ url: URL, todayStart: Double) -> (tokens: Int, epochs: [Double])? {
         var tokens = 0
         var epochs: [Double] = []
-        for line in lines {
-            if line.range(of: Self.claudeUsageNeedle) == nil { continue }
+        let ok = streamLineData(url) { line in
+            if line.range(of: Self.claudeUsageNeedle) == nil { return true }
             guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                   let message = obj["message"] as? [String: Any],
-                  let usage = message["usage"] as? [String: Any] else { continue }
+                  let usage = message["usage"] as? [String: Any] else { return true }
             let entryEpoch = parseISO(obj["timestamp"] as? String)
-            if let e = entryEpoch, e < todayStart { continue }
+            if let e = entryEpoch, e < todayStart { return true }
             tokens += intVal(usage["input_tokens"]) + intVal(usage["output_tokens"])
                 + intVal(usage["cache_creation_input_tokens"]) + intVal(usage["cache_read_input_tokens"])
             if let e = entryEpoch { epochs.append(e) }
+            return true
         }
+        guard ok else { return nil }
         return (tokens, epochs)
     }
 
@@ -356,13 +377,12 @@ final class StatusService {
 
         if let names = try? fm.contentsOfDirectory(at: dayDir, includingPropertiesForKeys: nil) {
             for url in names where url.pathExtension == "jsonl" {
-                guard let lines = readLineData(url) else { continue }
                 var sessionMaxTokens = 0
-                for line in lines {
-                    if line.range(of: Self.codexTokenNeedle) == nil { continue }
+                let ok = streamLineData(url) { line in
+                    if line.range(of: Self.codexTokenNeedle) == nil { return true }
                     guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                           let payload = obj["payload"] as? [String: Any],
-                          payload["type"] as? String == "token_count" else { continue }
+                          payload["type"] as? String == "token_count" else { return true }
                     let info = payload["info"] as? [String: Any]
                     let totalUsage = info?["total_token_usage"] as? [String: Any]
                     let total = intVal(totalUsage?["total_tokens"])
@@ -371,8 +391,9 @@ final class StatusService {
                         let e = parseISO(obj["timestamp"] as? String) ?? 0
                         if e >= latestRateLimitsTs { latestRateLimitsTs = e; latestRateLimits = rl }
                     }
+                    return true
                 }
-                tokensToday += sessionMaxTokens
+                if ok { tokensToday += sessionMaxTokens }
             }
         }
 
@@ -414,15 +435,15 @@ final class StatusService {
                 .contentModificationDate?.timeIntervalSince1970 else { continue }
             if mtime > lastMtime { lastMtime = mtime }
             if mtime < todayStart { continue }
-            guard let lines = readLineData(url) else { continue }
-            for line in lines {
-                if line.range(of: Self.kimiUsageNeedle) == nil { continue }
+            let _ = streamLineData(url) { line in
+                if line.range(of: Self.kimiUsageNeedle) == nil { return true }
                 guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-                      let usage = obj["usage"] as? [String: Any] else { continue }
+                      let usage = obj["usage"] as? [String: Any] else { return true }
                 let entryEpoch = (obj["time"] as? NSNumber)?.doubleValue
-                if let e = entryEpoch, e / 1000.0 < todayStart { continue }
+                if let e = entryEpoch, e / 1000.0 < todayStart { return true }
                 tokensToday += intVal(usage["inputOther"]) + intVal(usage["output"])
                     + intVal(usage["inputCacheRead"]) + intVal(usage["inputCacheCreation"])
+                return true
             }
         }
 

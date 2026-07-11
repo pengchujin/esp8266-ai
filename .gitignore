@@ -1,11 +1,30 @@
-firmware/.pio/
-firmware/.pio-venv/
-mac-app/.build/
-windows-app/**/bin/
-windows-app/**/obj/
+# Python virtual environment
+.venv/
+
+# macOS
+.DS_Store
+
+# Python
 __pycache__/
 *.pyc
-.DS_Store
+
+# Editor / IDE
 .claude/
-dist/
+.vscode/
+.idea/
+
+# Firmware build artifacts
+firmware/.pio/
+firmware/.pio-venv/
+
+# macOS app build artifacts
+mac-app/.build/
+mac-app/dist/
+mac-app/Vendor/
+
+# Windows app build artifacts
+windows-app/**/bin/
+windows-app/**/obj/
+
+# Project-specific generated docs (do not commit)
 docs/

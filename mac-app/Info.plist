@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>AIClockBridge</string>
+    <key>CFBundleName</key>
+    <string>AIClockBridge</string>
+    <key>CFBundleExecutable</key>
+    <string>AIClockBridge</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__BUILD__</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>SUFeedURL</key>
+    <string>__FEED_URL__</string>
+    <key>SUPublicEDKey</key>
+    <string>__PUBLIC_KEY__</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+</dict>
+</plist>

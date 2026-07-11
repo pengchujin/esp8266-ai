@@ -1,4 +1,5 @@
 import AppKit
+import Sparkle
 
 // Entry point. Runs as an "accessory" app (menu-bar only, no Dock icon, no main
 // window) and starts the /status HTTP server that the ESP8266 clock polls.
@@ -48,6 +49,8 @@ let nowPlaying = NowPlayingMonitor()
 nowPlaying.start()
 service.musicPlayingProvider = { nowPlaying.snapshot.playing }
 
+let localUpdatesDir = "\(NSHomeDirectory())/Library/Application Support/AIClockBridge/updates"
+
 let server = HTTPServer(port: port, routes: [
     "/": { service.snapshot().jsonData() },
     "/status": { service.snapshot().jsonData() },
@@ -67,6 +70,8 @@ let server = HTTPServer(port: port, routes: [
         }
         return Data("{\"ok\":false}".utf8)
     },
+], staticRoots: [
+    "/updates/": localUpdatesDir,
 ])
 // Passive discovery: the clock polls us, so its source IP identifies it.
 // Remember it (for auto-pairing / DHCP-change self-healing) and adopt it
@@ -94,8 +99,13 @@ do {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+
+// Create Sparkle updater controller early, before the run loop starts.
 let menuBar = MenuBarController(service: service, usage: usage, netMonitor: netMonitor,
                                 nowPlaying: nowPlaying, port: port)
+let updaterController = SPUStandardUpdaterController(
+    startingUpdater: true, updaterDelegate: menuBar, userDriverDelegate: nil)
+menuBar.updaterController = updaterController
 _ = menuBar // retain
 usage.startAutoRefresh()
 app.run()

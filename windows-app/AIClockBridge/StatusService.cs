@@ -338,19 +338,19 @@ sealed class StatusService
     static double TodayStartEpoch() =>
         new DateTimeOffset(DateTime.Today).ToUnixTimeMilliseconds() / 1000.0;
 
-    /// Lossy UTF-8 read split into lines (skips files locked by the CLIs).
-    static string[] ReadLines(string path)
+    /// Streams a file line-by-line (skips files locked by the CLIs).
+    /// Avoids loading a whole multi-megabyte JSONL into memory at once.
+    /// Throws on open/read failure so callers can skip caching that file for
+    /// this scan and retry on the next poll.
+    static IEnumerable<string> ReadLines(string path)
     {
-        try
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                                      FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(fs, Encoding.UTF8);
+        string line;
+        while ((line = reader.ReadLine()) != null)
         {
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
-                                          FileShare.ReadWrite | FileShare.Delete);
-            using var reader = new StreamReader(fs, Encoding.UTF8);
-            return reader.ReadToEnd().Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        }
-        catch
-        {
-            return null;
+            if (!string.IsNullOrEmpty(line)) yield return line;
         }
     }
 
@@ -425,8 +425,9 @@ sealed class StatusService
                 // are otherwise static history we can reuse.
                 if (!_claudeCache.TryGetValue(file, out var entry) || entry.Mtime != mtime)
                 {
-                    var lines = ReadLines(file);
-                    if (lines == null) continue; // locked/unreadable this pass — retry next scan, don't cache
+                    IEnumerable<string> lines;
+                    try { lines = ReadLines(file); }
+                    catch { continue; } // locked/unreadable this pass — retry next scan, don't cache
                     var parsed = ParseClaudeFile(lines, todayStart);
                     entry = (mtime, parsed.Tokens, parsed.Epochs);
                     _claudeCache[file] = entry;
@@ -456,7 +457,7 @@ sealed class StatusService
 
     /// Parse one Claude jsonl: today's token total + each today entry's epoch
     /// (epochs feed the rolling 5h session window). Only called on new/changed files.
-    (int Tokens, List<double> Epochs) ParseClaudeFile(string[] lines, double todayStart)
+    (int Tokens, List<double> Epochs) ParseClaudeFile(IEnumerable<string> lines, double todayStart)
     {
         var tokens = 0;
         var epochs = new List<double>();
@@ -519,8 +520,9 @@ sealed class StatusService
         {
             foreach (var file in Directory.EnumerateFiles(dayDir, "*.jsonl"))
             {
-                var lines = ReadLines(file);
-                if (lines == null) continue;
+                IEnumerable<string> lines;
+                try { lines = ReadLines(file); }
+                catch { continue; }
                 var sessionMaxTokens = 0;
                 foreach (var line in lines)
                 {
@@ -615,8 +617,9 @@ sealed class StatusService
             }
             if (mtime > lastMtime) lastMtime = mtime;
             if (mtime < todayStart) continue;
-            var lines = ReadLines(file);
-            if (lines == null) continue;
+            IEnumerable<string> lines;
+            try { lines = ReadLines(file); }
+            catch { continue; }
             foreach (var line in lines)
             {
                 if (!line.Contains("\"type\":\"usage.record\"")) continue;

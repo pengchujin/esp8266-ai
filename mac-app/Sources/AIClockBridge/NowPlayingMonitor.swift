@@ -168,21 +168,28 @@ final class NowPlayingMonitor {
         helperRunning = true
         lock.unlock()
 
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let result = Self.runProbe()
-            DispatchQueue.main.async {
+        // Prefer the in-process MediaRemote path (no process spawn). The probe
+        // script is only a fallback for systems where the private framework
+        // can't be resolved dynamically.
+        if let getNowPlayingInfo = getNowPlayingInfo {
+            getNowPlayingInfo(.main) { [weak self] info in
                 guard let self = self else { return }
-                if let result {
-                    self.applyProbe(result)
-                } else if let getNowPlayingInfo = self.getNowPlayingInfo {
-                    getNowPlayingInfo(.main) { [weak self] info in
-                        self?.apply(info: info ?? [:])
-                    }
-                }
+                self.apply(info: info ?? [:])
                 self.lock.lock()
                 self.helperRunning = false
                 self.lock.unlock()
             }
+            return
+        }
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            if let result = Self.runProbe() {
+                DispatchQueue.main.async { self.applyProbe(result) }
+            }
+            self.lock.lock()
+            self.helperRunning = false
+            self.lock.unlock()
         }
     }
 
