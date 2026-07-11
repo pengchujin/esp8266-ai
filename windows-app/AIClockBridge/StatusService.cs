@@ -262,6 +262,10 @@ sealed class StatusService
     StatusSnapshot _cached;
     double _cachedAt;
 
+    // Per-file parse cache (keyed by path): unchanged append-only logs are not
+    // re-read/re-parsed every scan. Mutated only under _lock via ReadClaude/Snapshot.
+    readonly Dictionary<string, (double Mtime, int Tokens, List<double> Epochs)> _claudeCache = new();
+
     static double Now() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
 
     public StatusSnapshot Snapshot()
@@ -401,6 +405,7 @@ sealed class StatusService
             {
                 files = Array.Empty<string>();
             }
+            var livePaths = new HashSet<string>();
             foreach (var file in files)
             {
                 double mtime;
@@ -415,30 +420,31 @@ sealed class StatusService
                 }
                 if (mtime > lastMtime) lastMtime = mtime;
                 if (mtime < todayStart) continue; // no activity today, skip parsing
-                var lines = ReadLines(file);
-                if (lines == null) continue;
-                foreach (var line in lines)
+                livePaths.Add(file);
+                // Only re-read+parse a file when its mtime changed; append-only logs
+                // are otherwise static history we can reuse.
+                if (!_claudeCache.TryGetValue(file, out var entry) || entry.Mtime != mtime)
                 {
-                    if (!line.Contains("\"usage\":{")) continue;
-                    JsonDocument doc;
-                    try { doc = JsonDocument.Parse(line); } catch { continue; }
-                    using (doc)
-                    {
-                        var root = doc.RootElement;
-                        if (!TryProp(root, "message", out var message)
-                            || !TryProp(message, "usage", out var usage)) continue;
-                        var entryEpoch = ParseIso(StringVal(root, "timestamp"));
-                        if (entryEpoch.HasValue && entryEpoch.Value < todayStart) continue;
-                        tokensToday += IntVal(usage, "input_tokens") + IntVal(usage, "output_tokens")
-                            + IntVal(usage, "cache_creation_input_tokens")
-                            + IntVal(usage, "cache_read_input_tokens");
-                        if (entryEpoch.HasValue && now - entryEpoch.Value < 5 * 3600)
-                        {
-                            if (!firstActiveInWindow.HasValue || entryEpoch.Value < firstActiveInWindow.Value)
-                                firstActiveInWindow = entryEpoch.Value;
-                        }
-                    }
+                    var lines = ReadLines(file);
+                    if (lines == null) continue; // locked/unreadable this pass — retry next scan, don't cache
+                    var parsed = ParseClaudeFile(lines, todayStart);
+                    entry = (mtime, parsed.Tokens, parsed.Epochs);
+                    _claudeCache[file] = entry;
                 }
+                tokensToday += entry.Tokens;
+                foreach (var e in entry.Epochs)
+                {
+                    if (now - e < 5 * 3600 && (!firstActiveInWindow.HasValue || e < firstActiveInWindow.Value))
+                        firstActiveInWindow = e;
+                }
+            }
+            // Drop entries for files that rolled out of "today" so the cache doesn't grow forever.
+            if (_claudeCache.Count != livePaths.Count)
+            {
+                var stale = new List<string>();
+                foreach (var k in _claudeCache.Keys)
+                    if (!livePaths.Contains(k)) stale.Add(k);
+                foreach (var k in stale) _claudeCache.Remove(k);
             }
         }
 
@@ -446,6 +452,33 @@ sealed class StatusService
         if (firstActiveInWindow.HasValue) s.SessionMin = (int)((now - firstActiveInWindow.Value) / 60);
         s.Status = StatusFromDelta(lastMtime > 0 ? now - lastMtime : 1e9);
         return s;
+    }
+
+    /// Parse one Claude jsonl: today's token total + each today entry's epoch
+    /// (epochs feed the rolling 5h session window). Only called on new/changed files.
+    (int Tokens, List<double> Epochs) ParseClaudeFile(string[] lines, double todayStart)
+    {
+        var tokens = 0;
+        var epochs = new List<double>();
+        foreach (var line in lines)
+        {
+            if (!line.Contains("\"usage\":{")) continue;
+            JsonDocument doc;
+            try { doc = JsonDocument.Parse(line); } catch { continue; }
+            using (doc)
+            {
+                var root = doc.RootElement;
+                if (!TryProp(root, "message", out var message)
+                    || !TryProp(message, "usage", out var usage)) continue;
+                var entryEpoch = ParseIso(StringVal(root, "timestamp"));
+                if (entryEpoch.HasValue && entryEpoch.Value < todayStart) continue;
+                tokens += IntVal(usage, "input_tokens") + IntVal(usage, "output_tokens")
+                    + IntVal(usage, "cache_creation_input_tokens")
+                    + IntVal(usage, "cache_read_input_tokens");
+                if (entryEpoch.HasValue) epochs.Add(entryEpoch.Value);
+            }
+        }
+        return (tokens, epochs);
     }
 
     // MARK: - Codex
