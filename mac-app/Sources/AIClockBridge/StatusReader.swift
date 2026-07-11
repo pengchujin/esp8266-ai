@@ -58,6 +58,7 @@ final class StatusService {
     // Fast-path byte needles: only lines containing these get JSON-parsed.
     private static let claudeUsageNeedle = Data("\"usage\":{".utf8)
     private static let codexTokenNeedle = Data("\"token_count\"".utf8)
+    private static let kimiUsageNeedle = Data("\"type\":\"usage.record\"".utf8)
 
     // Per-file parse cache (keyed by path): unchanged append-only logs are not
     // re-read every scan. Mutated only under `lock` via readClaude/snapshot.
@@ -413,10 +414,10 @@ final class StatusService {
                 .contentModificationDate?.timeIntervalSince1970 else { continue }
             if mtime > lastMtime { lastMtime = mtime }
             if mtime < todayStart { continue }
-            guard let lines = readLines(url) else { continue }
+            guard let lines = readLineData(url) else { continue }
             for line in lines {
-                if !line.contains("\"type\":\"usage.record\"") { continue }
-                guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                if line.range(of: Self.kimiUsageNeedle) == nil { continue }
+                guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                       let usage = obj["usage"] as? [String: Any] else { continue }
                 let entryEpoch = (obj["time"] as? NSNumber)?.doubleValue
                 if let e = entryEpoch, e / 1000.0 < todayStart { continue }
