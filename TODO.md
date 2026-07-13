@@ -1,8 +1,9 @@
 # TODO
 
-## 股票显示页
-- 数据源已调研并实测（2026-07-13）：**腾讯行情接口**（主）`http://qt.gtimg.cn/q=sh600519,hk00700,usAAPL` —— 免 key、A股实时、支持 A股/港股/美股批量查询、GBK 编码、`~` 分隔字段；**新浪**（备）`http://hq.sinajs.cn/list=...`（必须带 `Referer: https://finance.sina.com.cn`）；东方财富 `push2.eastmoney.com/api/qt/stock/get` 返回 JSON。故障切换设计可参考 [Ashare](https://github.com/mpquant/Ashare)。
-- 方案：桥接端 2s 轮询自选股 → `/stock` 端点或并入 `/status`；设备新增股票页（复用网速页局部刷新套路），涨红跌绿大字 + 名称（中文需 Mac 渲染位图下发，同音乐文字条）；右键菜单/设备网页配置自选股列表。
+## 股票页遗留项（主体已于 2026-07-13 实现）
+- 备用数据源故障切换：新浪 `hq.sinajs.cn`（需 Referer 头）作腾讯接口的 fallback，参考 [Ashare](https://github.com/mpquant/Ashare) 双核心设计
+- 有线（无 WiFi）模式下的中文名称条：名称位图走 HTTP，纯 USB 时只显示代码，需串口分帧方案
+- 设备网页配置自选股（目前只有 Mac/Win 菜单）
 
 ## USB 有线直连（本轮做了 Mac + 固件，遗留项）
 - Windows 桥接串口支持（System.IO.Ports，扫 COM 口 + 同款 #HELLO/#STATUS/#NET 协议）

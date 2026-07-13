@@ -13,6 +13,7 @@ import Foundation
 final class SerialLink {
     private let service: StatusService
     private let netMonitor: NetSpeedMonitor
+    private let stockMonitor: StockMonitor
 
     private var fd: Int32 = -1
     private var portPath = ""
@@ -24,9 +25,10 @@ final class SerialLink {
     private var rxBuf = Data()
     private var timer: Timer?
 
-    init(service: StatusService, netMonitor: NetSpeedMonitor) {
+    init(service: StatusService, netMonitor: NetSpeedMonitor, stockMonitor: StockMonitor) {
         self.service = service
         self.netMonitor = netMonitor
+        self.stockMonitor = stockMonitor
     }
 
     func start() {
@@ -60,6 +62,7 @@ final class SerialLink {
         if now.timeIntervalSince(lastStatusAt) > 5 {
             lastStatusAt = now
             send(frame("#STATUS ", service.snapshot().jsonData()))
+            send(frame("#STOCK ", stockMonitor.jsonData()))
         }
         if now.timeIntervalSince(lastNetAt) > 2 {
             lastNetAt = now

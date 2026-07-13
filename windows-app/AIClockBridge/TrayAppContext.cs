@@ -22,12 +22,12 @@ sealed class TrayAppContext : ApplicationContext
     readonly Dictionary<string, ToolStripMenuItem> _modeItems = new();
 
     public TrayAppContext(StatusService service, UsageFetcher usage, NetSpeedMonitor netMonitor,
-                          NowPlayingMonitor nowPlaying, int port)
+                          NowPlayingMonitor nowPlaying, StockMonitor stockMonitor, int port)
     {
         _service = service;
         _usage = usage;
         _port = port;
-        _mirror = new MirrorForm(service, netMonitor, nowPlaying);
+        _mirror = new MirrorForm(service, netMonitor, nowPlaying, stockMonitor);
 
         BuildMenu();
         _trayIcon = new NotifyIcon
@@ -80,6 +80,7 @@ sealed class TrayAppContext : ApplicationContext
         {
             ("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
             ("固定 Codex", "codex"), ("网速曲线", "net"), ("音乐播放", "music"),
+            ("股票行情", "stock"),
         })
         {
             var item = new ToolStripMenuItem(title);
@@ -89,6 +90,19 @@ sealed class TrayAppContext : ApplicationContext
         }
         _menu.Items.Add(displayMenu);
         // (屏幕亮度在左键弹出的镜像页底部，做成滑条了)
+
+        _menu.Items.Add(MakeItem("设置自选股…", (_, _) =>
+        {
+            var input = InputDialog.Show(
+                "自选股",
+                "逗号分隔的腾讯行情代码：sh/sz=A股、hk=港股、us=美股\n例如 sh600519,hk00700,usAAPL（设备最多显示 4 只）",
+                string.Join(",", StockMonitor.Symbols), "sh000001,usAAPL");
+            if (input != null)
+            {
+                StockMonitor.Symbols = input.Split(',',
+                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            }
+        }));
 
         _menu.Items.Add(MakeItem("更换桌宠动画…（petdex）", (_, _) => OpenPetPicker()));
 

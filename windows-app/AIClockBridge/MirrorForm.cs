@@ -40,6 +40,9 @@ sealed class MirrorControl : Control
     double[] _histRx = new double[NetCols];
     double[] _histTx = new double[NetCols];
 
+    public bool StockMode;
+    public StockMonitor.Row[] StockRows = Array.Empty<StockMonitor.Row>();
+
     public bool MusicMode;
     public string MusicTitle = "";
     public string MusicArtist = "";
@@ -112,6 +115,11 @@ sealed class MirrorControl : Control
         if (MusicMode)
         {
             DrawMusicScene(g);
+            return;
+        }
+        if (StockMode)
+        {
+            DrawStockScene(g);
             return;
         }
 
@@ -317,6 +325,38 @@ sealed class MirrorControl : Control
         }
     }
 
+    // Stock watchlist, same 54px rows as the firmware: grey code (the mirror
+    // can render the CJK name next to it), big white price, colored change.
+    void DrawStockScene(Graphics g)
+    {
+        using var greyBrush = new SolidBrush(Color.FromArgb(140, 140, 140));
+        using var codeFont = new Font("Microsoft YaHei UI", 7.5f);
+        using var valueFont = new Font("Consolas", 13f, FontStyle.Bold);
+        using var labelFont = new Font("Consolas", 6.5f);
+        if (StockRows.Length == 0)
+        {
+            using var center0 = new StringFormat { Alignment = StringAlignment.Center };
+            using var hintFont = new Font("Microsoft YaHei UI", 8.5f);
+            g.DrawString("未配置自选股\n右键托盘 → 设置自选股…", hintFont, greyBrush,
+                         new RectangleF(0, 104, 240, 40), center0);
+            return;
+        }
+        for (int i = 0; i < Math.Min(StockRows.Length, 4); i++)
+        {
+            var row = StockRows[i];
+            float y0 = 10 + i * 54;
+            var label = row.Name.Length == 0 ? row.Code : $"{row.Code}  {row.Name}";
+            g.DrawString(label, codeFont, greyBrush, 14, y0);
+            g.DrawString(row.Price, valueFont, Brushes.White, 12, y0 + 16);
+            using var pctBrush = new SolidBrush(row.Up > 0 ? Color.FromArgb(255, 59, 48)
+                : (row.Up < 0 ? Green : Color.LightGray));
+            using var right = new StringFormat { Alignment = StringAlignment.Far };
+            g.DrawString(row.Pct, valueFont, pctBrush, new RectangleF(120, y0 + 16, 106, 22), right);
+        }
+        using var center = new StringFormat { Alignment = StringAlignment.Center };
+        g.DrawString("STOCKS", labelFont, greyBrush, new RectangleF(0, 226, 240, 12), center);
+    }
+
     /// Same compact unit strings the firmware prints ("2.3M", "480K").
     public static string DeviceSpeedText(double bps)
     {
@@ -345,10 +385,11 @@ sealed class MirrorForm : Form
     readonly StatusService _service;
     readonly NetSpeedMonitor _netMonitor;
     readonly NowPlayingMonitor _nowPlaying;
+    readonly StockMonitor _stockMonitor;
     readonly MirrorControl _mirror = new();
     readonly RadioButton[] _modeButtons;
-    static readonly string[] Modes = { "auto", "claude", "codex", "net", "music" };
-    static readonly string[] ModeLabels = { "自动", "Claude", "Codex", "网速", "音乐" };
+    static readonly string[] Modes = { "auto", "claude", "codex", "net", "music", "stock" };
+    static readonly string[] ModeLabels = { "自动", "Claude", "Codex", "网速", "音乐", "股票" };
     readonly Label _statusLabel = new();
     readonly TrackBar _brightness = new() { Minimum = 0, Maximum = 100, TickStyle = TickStyle.None };
     readonly Label _brightnessValue = new();
@@ -369,11 +410,13 @@ sealed class MirrorForm : Form
     string _fetchingSlot;
     bool _applyingMode; // suppress CheckedChanged while reflecting device state
 
-    public MirrorForm(StatusService service, NetSpeedMonitor netMonitor, NowPlayingMonitor nowPlaying)
+    public MirrorForm(StatusService service, NetSpeedMonitor netMonitor, NowPlayingMonitor nowPlaying,
+                      StockMonitor stockMonitor)
     {
         _service = service;
         _netMonitor = netMonitor;
         _nowPlaying = nowPlaying;
+        _stockMonitor = stockMonitor;
 
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
@@ -569,6 +612,13 @@ sealed class MirrorForm : Form
         var enteringNet = info.Effective == "net" && !_mirror.NetMode;
         _mirror.NetMode = info.Effective == "net";
         _mirror.MusicMode = info.Effective == "music";
+        _mirror.StockMode = info.Effective == "stock";
+        if (_mirror.StockMode)
+        {
+            _mirror.StockRows = _stockMonitor.Snapshot;
+            _mirror.Invalidate();
+            return;
+        }
         if (_mirror.NetMode)
         {
             if (enteringNet) _mirror.ResetNetSweep(); // fresh sweep, like the device

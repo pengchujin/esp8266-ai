@@ -84,6 +84,8 @@ final class MirrorView: NSView {
     var netMode = false
     var netCPU = -1 // -1 = hidden (CPU/MEM row disabled in the menu)
     var netMem = -1
+    var stockMode = false
+    var stockRows: [StockMonitor.Row] = []
     var netHeaderDL = "0B"
     var netHeaderUL = "0B"
     private static let netCols = 224 // NET_CHART_W
@@ -141,6 +143,11 @@ final class MirrorView: NSView {
         }
         if musicMode {
             drawMusicScene(ctx)
+            ctx.restoreGState()
+            return
+        }
+        if stockMode {
+            drawStockScene()
             ctx.restoreGState()
             return
         }
@@ -372,6 +379,50 @@ final class MirrorView: NSView {
             ])
     }
 
+    // Stock watchlist, same 54px rows as the firmware: grey code (the mirror
+    // can render the CJK name next to it), big white price, colored change.
+    private func drawStockScene() {
+        let grey = NSColor(white: 0.55, alpha: 1)
+        let codeFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)
+        let valueFont = NSFont.monospacedSystemFont(ofSize: 17, weight: .bold)
+        if stockRows.isEmpty {
+            let style = NSMutableParagraphStyle()
+            style.alignment = .center
+            ("未配置自选股\n右键菜单 → 设置自选股…" as NSString).draw(
+                in: NSRect(x: 0, y: 104, width: 240, height: 40), withAttributes: [
+                    .font: NSFont.systemFont(ofSize: 11), .foregroundColor: grey,
+                    .paragraphStyle: style,
+                ])
+            return
+        }
+        for (i, row) in stockRows.prefix(4).enumerated() {
+            let y0 = CGFloat(10 + i * 54)
+            let label = row.name.isEmpty ? row.code : "\(row.code)  \(row.name)"
+            (label as NSString).draw(at: NSPoint(x: 14, y: y0), withAttributes: [
+                .font: codeFont, .foregroundColor: grey,
+            ])
+            (row.price as NSString).draw(at: NSPoint(x: 14, y: y0 + 15), withAttributes: [
+                .font: valueFont, .foregroundColor: NSColor.white,
+            ])
+            let pctColor = row.up > 0 ? NSColor(calibratedRed: 1, green: 0.23, blue: 0.19, alpha: 1)
+                : (row.up < 0 ? NSColor(calibratedRed: 0, green: 0.85, blue: 0.2, alpha: 1)
+                              : NSColor.lightGray)
+            let style = NSMutableParagraphStyle()
+            style.alignment = .right
+            (row.pct as NSString).draw(
+                in: NSRect(x: 120, y: y0 + 15, width: 106, height: 22), withAttributes: [
+                    .font: valueFont, .foregroundColor: pctColor, .paragraphStyle: style,
+                ])
+        }
+        let center = NSMutableParagraphStyle()
+        center.alignment = .center
+        ("STOCKS" as NSString).draw(
+            in: NSRect(x: 0, y: 224, width: 240, height: 12), withAttributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 8, weight: .medium),
+                .foregroundColor: grey, .paragraphStyle: center,
+            ])
+    }
+
     /// Same compact unit strings the firmware prints ("2.3M", "480K").
     static func deviceSpeedText(_ bps: Double) -> String {
         if bps >= 1_000_000 { return String(format: "%.1fM", bps / 1_000_000) }
@@ -386,9 +437,10 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private let service: StatusService
     private let netMonitor: NetSpeedMonitor
     private let nowPlaying: NowPlayingMonitor
+    private let stockMonitor: StockMonitor
     private let popover = NSPopover()
     private let mirror = MirrorView()
-    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐"],
+    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐", "股票"],
                                                  trackingMode: .selectOne, target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "连接设备中…")
     private let brightnessSlider = NSSlider(value: 100, minValue: 0, maxValue: 100,
@@ -406,10 +458,12 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var lastInfo: DeviceInfo?
     private var fetchingSlot: String?
 
-    init(service: StatusService, netMonitor: NetSpeedMonitor, nowPlaying: NowPlayingMonitor) {
+    init(service: StatusService, netMonitor: NetSpeedMonitor, nowPlaying: NowPlayingMonitor,
+         stockMonitor: StockMonitor) {
         self.service = service
         self.netMonitor = netMonitor
         self.nowPlaying = nowPlaying
+        self.stockMonitor = stockMonitor
         super.init()
         popover.behavior = .transient
         popover.delegate = self
@@ -542,7 +596,8 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 self.applyScene(info)
                 self.ensureSprite(info)
                 self.syncBrightness(info)
-                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3, "music": 4][info.mode] ?? 0
+                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3,
+                               "music": 4, "stock": 5][info.mode] ?? 0
                 self.modeControl.selectedSegment = modeIdx
                 let modeText = info.mode == "auto" ? "自动切换"
                     : info.mode == "net" ? "网速曲线"
@@ -573,6 +628,12 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         let enteringNet = info.effective == "net" && !mirror.netMode
         mirror.netMode = info.effective == "net"
         mirror.musicMode = info.effective == "music"
+        mirror.stockMode = info.effective == "stock"
+        if mirror.stockMode {
+            mirror.stockRows = stockMonitor.snapshot
+            mirror.needsDisplay = true
+            return
+        }
         if mirror.netMode {
             if enteringNet { mirror.resetNetSweep() } // fresh sweep, like the device's chrome reset
             mirror.needsDisplay = true
@@ -673,7 +734,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func modeChanged() {
-        let mode = ["auto", "claude", "codex", "net", "music"][max(0, modeControl.selectedSegment)]
+        let mode = ["auto", "claude", "codex", "net", "music", "stock"][max(0, modeControl.selectedSegment)]
         DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
     }
 }

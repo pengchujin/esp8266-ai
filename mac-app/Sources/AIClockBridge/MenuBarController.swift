@@ -18,12 +18,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var modeItems: [String: NSMenuItem] = [:]
 
     init(service: StatusService, usage: UsageFetcher, netMonitor: NetSpeedMonitor,
-         nowPlaying: NowPlayingMonitor, port: UInt16) {
+         nowPlaying: NowPlayingMonitor, stockMonitor: StockMonitor, port: UInt16) {
         self.service = service
         self.usage = usage
         self.port = port
         self.mirrorPopover = MirrorPopoverController(service: service, netMonitor: netMonitor,
-                                                     nowPlaying: nowPlaying)
+                                                     nowPlaying: nowPlaying, stockMonitor: stockMonitor)
         super.init()
         buildMenu()
         if let button = statusItem.button {
@@ -81,7 +81,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let displayMenu = NSMenu()
         for (title, mode) in [("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
                               ("固定 Codex", "codex"), ("网速曲线", "net"),
-                              ("音乐播放", "music")] {
+                              ("音乐播放", "music"), ("股票行情", "stock")] {
             let item = NSMenuItem(title: title, action: #selector(setDisplayMode(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = mode
@@ -92,6 +92,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         displayItem.submenu = displayMenu
         menu.addItem(displayItem)
         // (屏幕亮度在左键弹出的镜像页底部，做成滑条了)
+
+        menu.addItem(makeItem("设置自选股…", #selector(setStockSymbols)))
 
         menu.addItem(makeItem("更换桌宠动画…（petdex）", #selector(openPetPicker)))
 
@@ -255,6 +257,23 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             } else {
                 self?.refreshDeviceSection()
             }
+        }
+    }
+
+    @objc private func setStockSymbols() {
+        let alert = NSAlert()
+        alert.messageText = "自选股"
+        alert.informativeText = "逗号分隔的腾讯行情代码：sh/sz=A股、hk=港股、us=美股\n例如 sh600519,hk00700,usAAPL（设备最多显示 4 只）"
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        input.stringValue = StockMonitor.symbols.joined(separator: ",")
+        input.placeholderString = "sh000001,usAAPL"
+        alert.accessoryView = input
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            StockMonitor.symbols = input.stringValue.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         }
     }
 
