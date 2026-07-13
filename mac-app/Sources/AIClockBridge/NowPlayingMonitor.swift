@@ -195,6 +195,19 @@ final class NowPlayingMonitor {
         getNowPlayingInfo = unsafeBitCast(sym, to: GetNowPlayingInfoFn.self)
     }
 
+    // MediaRemote keeps serving the last snapshot after a player stops or
+    // quits, playbackRate included. Since elapsed is extrapolated from that
+    // snapshot (elapsed += now - timestamp), a stale rate > 0 walks elapsed all
+    // the way to duration, where the clamp pins it forever: playing stays true,
+    // the clock parks on the music page, and the quota page never comes back.
+    //
+    // A player that is genuinely playing does not sit at the last second - it
+    // rolls into the next track and the snapshot moves. So elapsed sitting on
+    // duration means nobody is playing anything.
+    private static func stalledAtEnd(_ elapsed: Double, _ duration: Double) -> Bool {
+        duration > 0 && elapsed >= duration - 0.5
+    }
+
     private func apply(info: [AnyHashable: Any]) {
         let now = Date()
         let timestamp = dateValue(info["kMRMediaRemoteNowPlayingInfoTimestamp"])
@@ -211,7 +224,7 @@ final class NowPlayingMonitor {
         next.title = stringValue(info["kMRMediaRemoteNowPlayingInfoTitle"])
         next.artist = stringValue(info["kMRMediaRemoteNowPlayingInfoArtist"])
         next.album = stringValue(info["kMRMediaRemoteNowPlayingInfoAlbum"])
-        next.playing = rate > 0.01 && !next.title.isEmpty
+        next.playing = rate > 0.01 && !next.title.isEmpty && !Self.stalledAtEnd(elapsed, duration)
         next.elapsed = elapsed
         next.duration = duration
         next.updatedAt = now
@@ -253,8 +266,8 @@ final class NowPlayingMonitor {
         next.title = title
         next.artist = artist
         next.album = album
-        next.playing = playing && !title.isEmpty
         next.elapsed = duration > 0 ? max(0, min(duration, elapsed)) : max(0, elapsed)
+        next.playing = playing && !title.isEmpty && !Self.stalledAtEnd(next.elapsed, duration)
         next.duration = duration
         next.updatedAt = now
         if shouldIgnoreAsTransientEmpty(next) { return }
