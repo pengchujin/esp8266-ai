@@ -50,6 +50,9 @@ stockMonitor.start()
 // the serial line (works around AP client isolation; no WiFi setup needed).
 let serialLink = SerialLink(service: service, netMonitor: netMonitor, stockMonitor: stockMonitor)
 serialLink.start()
+// ...and route menu commands (display mode, brightness) down the same wire, so
+// a clock with no WiFi is controllable and not just readable.
+DeviceClient.sendWiredCommand = { [weak serialLink] in serialLink?.sendCommand($0) ?? false }
 
 let server = HTTPServer(port: port, routes: [
     "/": { service.snapshot().jsonData() },
