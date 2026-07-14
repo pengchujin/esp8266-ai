@@ -80,7 +80,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
         let displayMenu = NSMenu()
         for (title, mode) in [("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
-                              ("固定 Codex", "codex"), ("网速曲线", "net"),
+                              ("固定 Codex", "codex"), ("双栏额度（两家同屏，无桌宠）", "dual"),
+                              ("网速曲线", "net"),
                               ("音乐播放", "music"), ("股票行情", "stock")] {
             let item = NSMenuItem(title: title, action: #selector(setDisplayMode(_:)), keyEquivalent: "")
             item.target = self
@@ -173,6 +174,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                                info.codexCustomSprite ? "X:自定义" : "X:默认"]
                 let showing = info.mode == "net" ? "网速"
                     : info.mode == "music" ? "音乐"
+                    : info.mode == "dual" ? "双栏额度"
                     : (info.showing == "claude" ? "Claude" : "Codex")
                 self.deviceInfoItem.title =
                     "设备：\(info.ip) · 正在显示 \(showing) · \(sprites.joined(separator: " "))"

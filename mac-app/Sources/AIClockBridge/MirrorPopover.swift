@@ -118,6 +118,20 @@ final class MirrorView: NSView {
     var musicPlaying = false
     var musicCover: CGImage?
 
+    // dual-quota mirror: three cards in the device's own layout — Claude 5h,
+    // Claude weekly, Codex weekly. Same numbers the firmware draws, from the
+    // same /status snapshot.
+    struct DualRow {
+        var label = ""
+        var pct = "-"
+        var frac: Double = 0 // bar fill, 0-1
+        var reset = "-"
+    }
+    var dualMode = false
+    var dualRows: [DualRow] = []
+    var dualClaudeWorking = false
+    var dualCodexWorking = false
+
     private static let claudeLogo = Bundle.module.image(forResource: "claude-logo")
     private static let codexLogo = Bundle.module.image(forResource: "codex-logo")
 
@@ -148,6 +162,11 @@ final class MirrorView: NSView {
         }
         if stockMode {
             drawStockScene()
+            ctx.restoreGState()
+            return
+        }
+        if dualMode {
+            drawDualScene(ctx)
             ctx.restoreGState()
             return
         }
@@ -423,6 +442,86 @@ final class MirrorView: NSView {
             ])
     }
 
+    /// The dual quota page, in the firmware's own 240x240 coordinates: a title
+    /// line per app (logo, name, working dot) and one card per quota window.
+    /// Colors match the RGB565 constants in main.cpp.
+    private func drawDualScene(_ ctx: CGContext) {
+        let white = NSColor(srgbRed: 1.0, green: 0.984, blue: 0.969, alpha: 1)   // #fffbf7
+        let grey = NSColor(srgbRed: 0.710, green: 0.682, blue: 0.647, alpha: 1)  // #b5aea5
+        let track = NSColor(srgbRed: 0.161, green: 0.157, blue: 0.161, alpha: 1) // #292829
+        let orange = NSColor(srgbRed: 0.871, green: 0.459, blue: 0.322, alpha: 1) // #de7552
+        let blue = NSColor(srgbRed: 0.420, green: 0.455, blue: 0.973, alpha: 1)  // #6b74f8
+        let green = NSColor(srgbRed: 0.482, green: 0.557, blue: 0.353, alpha: 1) // #7b8e5a
+        let card = NSColor(srgbRed: 0.094, green: 0.110, blue: 0.094, alpha: 1)  // #181c18
+
+        let titleY: [CGFloat] = [3, 145]
+        let cardY: [CGFloat] = [29, 85, 171]
+        let labelFont = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let bigFont = NSFont.systemFont(ofSize: 27, weight: .semibold)
+
+        // title lines
+        for (i, y) in titleY.enumerated() {
+            let isClaude = i == 0
+            let logo = isClaude ? Self.claudeLogo : Self.codexLogo
+            if let logo = logo {
+                logo.draw(in: NSRect(x: 10, y: y, width: 24, height: 24))
+            }
+            ((isClaude ? "Claude" : "Codex") as NSString).draw(
+                at: NSPoint(x: 40, y: y + 5), withAttributes: [
+                    .font: labelFont, .foregroundColor: white,
+                ])
+            let working = isClaude ? dualClaudeWorking : dualCodexWorking
+            (working ? green : track).setFill()
+            NSBezierPath(ovalIn: NSRect(x: 218, y: y + 8, width: 8, height: 8)).fill()
+        }
+
+        // divider between the two halves
+        track.setFill()
+        NSRect(x: 8, y: 141, width: 224, height: 1).fill()
+
+        // cards
+        for (i, row) in dualRows.prefix(3).enumerated() {
+            let y = cardY[i]
+            let fill = i < 2 ? orange : blue
+            card.setFill()
+            NSBezierPath(roundedRect: NSRect(x: 8, y: y, width: 224, height: 52),
+                         xRadius: 8, yRadius: 8).fill()
+
+            (row.label as NSString).draw(at: NSPoint(x: 18, y: y + 10), withAttributes: [
+                .font: labelFont, .foregroundColor: grey,
+            ])
+            (row.pct as NSString).draw(at: NSPoint(x: 48, y: y + 4), withAttributes: [
+                .font: bigFont, .foregroundColor: white,
+            ])
+            let right = NSMutableParagraphStyle()
+            right.alignment = .right
+            (row.reset as NSString).draw(
+                in: NSRect(x: 150, y: y + 10, width: 72, height: 16), withAttributes: [
+                    .font: labelFont, .foregroundColor: grey, .paragraphStyle: right,
+                ])
+
+            track.setFill()
+            NSBezierPath(roundedRect: NSRect(x: 18, y: y + 40, width: 204, height: 6),
+                         xRadius: 3, yRadius: 3).fill()
+            let w = max(0, min(row.frac, 1)) * 204
+            if w > 0 {
+                fill.setFill()
+                NSBezierPath(roundedRect: NSRect(x: 18, y: y + 40, width: max(w, 6), height: 6),
+                             xRadius: 3, yRadius: 3).fill()
+            }
+        }
+
+        // the device flashes a red border when the bridge is stale or an app is
+        // waiting on approval; mirror it with the same 3px inset
+        if !deviceOK || (needsInput && flashOn) {
+            NSColor.red.setFill()
+            NSRect(x: 0, y: 0, width: 240, height: 3).fill()
+            NSRect(x: 0, y: 237, width: 240, height: 3).fill()
+            NSRect(x: 0, y: 0, width: 3, height: 240).fill()
+            NSRect(x: 237, y: 0, width: 3, height: 240).fill()
+        }
+    }
+
     /// Same compact unit strings the firmware prints ("2.3M", "480K").
     static func deviceSpeedText(_ bps: Double) -> String {
         if bps >= 1_000_000 { return String(format: "%.1fM", bps / 1_000_000) }
@@ -440,8 +539,9 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private let stockMonitor: StockMonitor
     private let popover = NSPopover()
     private let mirror = MirrorView()
-    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐", "股票"],
-                                                 trackingMode: .selectOne, target: nil, action: nil)
+    private let modeControl = NSSegmentedControl(
+        labels: ["自动", "Claude", "Codex", "双栏", "网速", "音乐", "股票"],
+        trackingMode: .selectOne, target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "连接设备中…")
     private let brightnessSlider = NSSlider(value: 100, minValue: 0, maxValue: 100,
                                             target: nil, action: nil)
@@ -596,12 +696,13 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 self.applyScene(info)
                 self.ensureSprite(info)
                 self.syncBrightness(info)
-                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3,
-                               "music": 4, "stock": 5][info.mode] ?? 0
+                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "dual": 3, "net": 4,
+                               "music": 5, "stock": 6][info.mode] ?? 0
                 self.modeControl.selectedSegment = modeIdx
                 let modeText = info.mode == "auto" ? "自动切换"
                     : info.mode == "net" ? "网速曲线"
-                    : info.mode == "music" ? "音乐播放" : "固定显示"
+                    : info.mode == "music" ? "音乐播放"
+                    : info.mode == "dual" ? "双栏额度" : "固定显示"
                 self.statusLabel.stringValue = "\(info.ip) · \(modeText) · 数据 \(info.bridge)"
             case .failure:
                 self.mirror.deviceOK = false
@@ -629,8 +730,28 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         mirror.netMode = info.effective == "net"
         mirror.musicMode = info.effective == "music"
         mirror.stockMode = info.effective == "stock"
+        mirror.dualMode = info.effective == "dual"
         if mirror.stockMode {
             mirror.stockRows = stockMonitor.snapshot
+            mirror.needsDisplay = true
+            return
+        }
+        if mirror.dualMode {
+            let snap = service.snapshot()
+            mirror.dualRows = [
+                MirrorView.DualRow(label: "5H", pct: Self.pctText(snap.claude.fiveHourPct),
+                                   frac: (snap.claude.fiveHourPct ?? 0) / 100,
+                                   reset: Self.resetText(snap.claude.fiveHourResetMin)),
+                MirrorView.DualRow(label: "WK", pct: Self.pctText(snap.claude.sevenDayPct),
+                                   frac: (snap.claude.sevenDayPct ?? 0) / 100,
+                                   reset: Self.resetText(snap.claude.sevenDayResetMin)),
+                MirrorView.DualRow(label: "WK", pct: Self.pctText(snap.codex.primaryPct),
+                                   frac: (snap.codex.primaryPct ?? 0) / 100,
+                                   reset: Self.resetText(snap.codex.primaryResetMin)),
+            ]
+            mirror.dualClaudeWorking = snap.claude.status == "working"
+            mirror.dualCodexWorking = snap.codex.status == "working"
+            mirror.needsInput = snap.claude.needsInput || snap.codex.needsInput
             mirror.needsDisplay = true
             return
         }
@@ -672,6 +793,14 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private static func pctText(_ pct: Double?) -> String {
         guard let p = pct, p >= 0 else { return "-" }
         return "\(Int(p))%"
+    }
+
+    /// "45m" / "2h 19m" / "2d 15h", matching the firmware's resetText().
+    private static func resetText(_ minutes: Int?) -> String {
+        guard let m = minutes, m >= 0 else { return "-" }
+        if m < 60 { return "\(m)m" }
+        if m < 1440 { return "\(m / 60)h \(m % 60)m" }
+        return "\(m / 1440)d \((m % 1440) / 60)h"
     }
 
     private func ensureSprite(_ info: DeviceInfo) {
@@ -721,7 +850,9 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.needsDisplay = true
         }
 
-        guard !mirror.frames.isEmpty else { return }
+        // the dual page draws no pet, so don't spin its frames (and don't force
+        // a full redraw of the cards every 120ms for nothing)
+        guard !mirror.frames.isEmpty, !mirror.dualMode else { return }
         let snap = service.snapshot()
         let working = info.showing == "codex"
             ? snap.codex.status == "working" : snap.claude.status == "working"
@@ -734,7 +865,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func modeChanged() {
-        let mode = ["auto", "claude", "codex", "net", "music", "stock"][max(0, modeControl.selectedSegment)]
+        let mode = ["auto", "claude", "codex", "dual", "net", "music", "stock"][max(0, modeControl.selectedSegment)]
         DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
     }
 }
