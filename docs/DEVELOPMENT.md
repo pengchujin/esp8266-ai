@@ -56,7 +56,7 @@ swift run                # 前台运行；或 swift build 后跑 .build/debug/AI
   也会自愈。菜单项走完整流程：最近来访 IP → 已配置地址复验 → 子网 /24 扫描兜底
   （覆盖"刚配完 WiFi、还没设过桥接"的全新设备）。
 - **设置设备地址…**：手动填时钟的 IP（开机时屏幕会显示；有自动配对后基本用不上）
-- **屏幕显示**：自动（谁在干活显示谁）/ 固定 Claude / 固定 Codex
+- **屏幕显示**：自动（谁在干活显示谁）/ 固定 Claude / 固定 Codex / 双栏额度
 - **音乐播放**：显示 Mac 当前播放的专辑封面、歌曲、歌手和进度
 - **更换桌宠动画…**：内置 [petdex.dev](https://petdex.dev) 画廊（3300+ 开源桌宠），
   搜索 → 选动画（待机/跑步/挥手…9 种）→ 预览 → 一键上传到设备
@@ -197,7 +197,7 @@ pio device monitor -b 115200
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/info` | 设备状态 JSON：ip/ssid/bridge/显示模式/当前显示/自定义精灵标记 |
-| POST | `/api/display` | `mode=auto\|claude\|codex\|net\|music` 切换屏幕显示（net=网速曲线页，music=音乐播放页）|
+| POST | `/api/display` | `mode=auto\|claude\|codex\|dual\|net\|music\|stock` 切换屏幕显示（dual=双栏额度页，net=网速曲线页，music=音乐播放页，stock=股票行情页）|
 | POST | `/api/bridge` | `host=ip:port` 设置桥接地址 |
 | POST | `/sprite/claude`、`/sprite/codex` | multipart 上传 GIF 并板上解码替换 |
 | POST | `/sprite/claude/reset`、`/sprite/codex/reset` | 删除自定义动画，恢复内置形象 |
@@ -246,6 +246,27 @@ Mac 端常驻进程由 LaunchAgent（`~/Library/LaunchAgents/local.AIClockBridge
 设备每 2 秒刷新一次音乐信息；封面只有在版本号变化时重新拉取。Mac 弹窗镜像同样显示
 音乐页，方便不用看设备也能确认布局。
 
+## 6.5 双栏额度页（可选，两家同屏，无桌宠）
+
+给"两边额度都想一眼看到"的人准备的可选页面。切进来的方式跟别的页一样：弹窗底部分段
+控件 / 右键菜单「双栏额度」/ `POST /api/display mode=dual`。**默认行为不受影响**，
+AUTO / 固定 Claude / 固定 Codex 仍然是原来的桌宠页。
+
+布局：Claude 在上、Codex 在下，中间一条分隔线。每个 app 一行标题（24x24 logo + 名字
++ 状态点，绿点=working），标题下面每个额度窗口一张通栏卡片（左边标签、大号百分比、
+右边重置倒计时、底部进度条）。Claude 两张卡（5H + WK），Codex 一张（见下）。桌宠和
+方形额度环在这一页都没有：240x240 放得下四个数字和两个 logo，再多就糊了。
+
+**Codex 只有一个窗口**：桥接仍把它叫 `primary`、注释仍写「5h」，但接口现在报
+`primary_window = 10080` 分钟（7 天）、次级窗口为空，OpenAI 取消了 5 小时限额。空出
+来的一行给了字号，好过摆一张显示「-」的卡。
+
+红框告警：桥接失联、或任意一边在等审批时，最外圈 3px 闪红（桌宠页是用额度环本身闪，
+这一页没有环）。
+
+字体是 Inter（SIL OFL，可随仓库分发），编译进 PROGMEM 约 33KB。改布局或换字体见
+`tools/` 一节。
+
 ## 7. Hooks 实时状态（秒级，参考 clawd-on-desk 的做法）
 
 除了日志 mtime 轮询（保留为兜底），bridge 还接收两个 CLI 官方 hooks 的事件推送，
@@ -289,6 +310,27 @@ ESP8266 总共只有 ~80KB RAM，一帧 120x120 的 RGB565 就 ~28KB，AnimatedG
 - disposal method 2（"恢复到背景色"）没有单独区分，未覆盖像素保留上一帧而不是清空；
   对循环角色动画来说无所谓。
 - WiFi 上传大文件偶尔会瞬时掉线（broken pipe 之类），失败重新上传一次即可。
+
+## 8. tools/：字体生成与渲染预览
+
+两个只在改双栏页时才用得上的工具，都是 Python，依赖装在虚拟环境里就行：
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install freetype-py pillow
+```
+
+**`tools/gen_vlw.py`** — 把 OTF 转成 TFT_eSPI 的 VLW 抗锯齿字体，直接写进
+`firmware/include/fonts/`（跑一次就复现提交里的编译输入，中间不用手动拷贝）。
+官方生成 VLW 只能用 Processing 的 sketch，这个脚本免掉那一步，自带三层校验
+（字节结构 / 灰度层级 / 渲染出图）。
+
+> 踩过的坑：VLW 的 `gdY` 就是 FreeType 的 `bitmap_top` 直接写入。网上流传的
+> `ascent - bitmap_top` 是反的，照那个写，字会整体下坠十几像素。
+
+**`tools/sim/`** — 渲染预览器。用同一套字体和坐标常量把固件的绘制过程复刻成 PNG，
+跑真实的 poll 序列（含 `100% → 5%` 这种会暴露残影的收缩转换）。**改布局先跑它再刷机**，
+不然只能刷进设备靠肉眼猜。注意它是预览工具，出图给人看，没有像素基准断言，
+不会在 CI 里拦住渲染回归。
 
 ## 已知限制 / TODO
 

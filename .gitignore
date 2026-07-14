@@ -8,3 +8,7 @@ __pycache__/
 .DS_Store
 .claude/
 dist/
+
+# gen_vlw.py scratch output (headers are committed, these are not)
+tools/fontcheck/
+tools/fonts/*.vlw

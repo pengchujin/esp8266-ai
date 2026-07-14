@@ -21,6 +21,9 @@
 #include "img/codex_sprite.h"
 #include "img/claude_logo.h"
 #include "img/codex_logo.h"
+#include "img/logo24.h"
+#include "fonts/inter13.h"
+#include "fonts/inter32.h"
 
 TFT_eSPI tft = TFT_eSPI();
 ESP8266WebServer webServer(80);
@@ -72,8 +75,17 @@ unsigned long lastSwitchMs = 0;
 
 // Display override, settable from the Mac app via POST /api/display:
 // auto = follow working status, claude/codex = pin that app on screen,
-// net/music = show Mac-side telemetry pages instead of the pet.
-enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC, MODE_STOCK };
+// net/music = show Mac-side telemetry pages instead of the pet,
+// dual = both apps' quota on one page (no pet, see the dual quota page below).
+enum DisplayMode {
+  MODE_AUTO,
+  MODE_CLAUDE,
+  MODE_CODEX,
+  MODE_NET,
+  MODE_MUSIC,
+  MODE_STOCK,
+  MODE_DUAL
+};
 DisplayMode displayMode = MODE_AUTO;
 
 // When AUTO and the Mac reports audio playing, the screen auto-switches to the
@@ -556,6 +568,204 @@ void drawAppLogo() {
     tft.pushImage(LOGO_X, LOGO_Y + r, w, 1, rowBuf);
   }
 }
+
+// ---------- dual quota page (MODE_DUAL) ----------
+// An alternative to the pet page, for people who want to watch both budgets at
+// once: Claude on top, Codex below, no pet and no ring. Opt-in - AUTO/claude/
+// codex are untouched. Each app gets a title line (logo + name + status dot)
+// and one full-width card per quota window: percentage, bar, reset time.
+//
+// 240x240 fits four numbers and two logos before it turns to soup, which is why
+// the pet has no room here and why the layout is built from measured widths
+// rather than eyeballed:
+//   32px "100%" = 90px, 13px "10h 30m" = 55px, 13px "WK" = 23px
+// A first attempt put the logo in its own left column and squeezed the data
+// into the remaining 156px; the number and the reset time could not both fit.
+
+const uint16_t C_WHITE = 0xFFDE;  // #fffbf7
+const uint16_t C_GREY = 0xB574;   // #b5aea5
+const uint16_t C_TRACK = 0x2945;  // #292829 bar track + divider
+const uint16_t C_ORANGE = 0xDBAA; // #de7552 Claude
+const uint16_t C_BLUE = 0x6BBF;   // #6b74f8 Codex
+const uint16_t C_GREEN = 0x7C6B;  // #7b8e5a "working" dot
+const uint16_t C_CARD = 0x18E3;   // #181c18 card fill
+
+// Claude gets two cards (5h + weekly). Codex gets one: the bridge still calls
+// its window "primary" and its own comments still say "5h", but the API now
+// reports primary_window = 10080 minutes (7 days) and leaves the secondary
+// window empty - OpenAI dropped the 5-hour limit. The freed row goes into type
+// size rather than a card showing "-".
+const int CARD_X = 8, CARD_W = 224, CARD_H = 52, CARD_R = 8; // cards span 8..232
+const int K_LAB_X = 18;   // label, inside the card
+const int K_NUM_X = 48;   // big number: 48..138 worst case
+const int K_TIME_R = 222; // reset time right-aligned: 167..222 worst case
+const int K_BAR_X = 18, K_BAR_W = 204, K_BAR_H = 6;
+
+// Y offsets inside a card. The label sits centred against the number's ink, not
+// its box - the 32px box is 31px tall but the digits only fill the top 24.
+const int K_NUM_Y = 4, K_LAB_Y = 10, K_BAR_Y = 40;
+
+// Title line: 24x24 logo, name, and the status dot pinned right.
+const int T_LOGO_X = 10, T_NAME_X = 40, T_DOT_X = 222;
+const int T_NAME_Y = 5, T_DOT_Y = 12; // relative to the title line's Y
+
+// Vertical stack, pulled up: on my case the bezel clips the last few rows of
+// the panel, so the bottom card ends at 223 (17px clear) and the top starts at 3.
+// TITLE1_Y must stay >= ALERT_W: the alert border owns the outermost 3px and
+// clears itself to black, which would eat the logo's top row if they overlapped.
+const int TITLE1_Y = 3, CARD1_Y = 29, CARD2_Y = 85;
+const int DIV_Y = 141;
+const int TITLE2_Y = 145, CARD3_Y = 171;
+
+// "45m" / "2h 19m" / "2d 15h", or "-" when the bridge has no value
+String resetText(int minutes) {
+  if (minutes < 0) return "-";
+  if (minutes < 60) return String(minutes) + "m";
+  if (minutes < 1440) return String(minutes / 60) + "h " + String(minutes % 60) + "m";
+  return String(minutes / 1440) + "d " + String((minutes % 1440) / 60) + "h";
+}
+
+void drawBar(int cardY, float pct, uint16_t color) {
+  int y = cardY + K_BAR_Y;
+  tft.fillRoundRect(K_BAR_X, y, K_BAR_W, K_BAR_H, K_BAR_H / 2, C_TRACK);
+  if (pct <= 0) return;
+  if (pct > 100) pct = 100;
+  int fw = (int)(K_BAR_W * pct / 100.0 + 0.5);
+  if (fw < K_BAR_H) fw = K_BAR_H; // a 1% fill still reads as a dot, not an empty track
+  tft.fillRoundRect(K_BAR_X, y, fw, K_BAR_H, K_BAR_H / 2, color);
+}
+
+void drawLogoAt(const uint16_t *logo, int w, int h, int x, int y) {
+  for (int r = 0; r < h; r++) {
+    memcpy_P(rowBuf, logo + (size_t)r * w, (size_t)w * 2);
+    tft.pushImage(x, y + r, w, 1, rowBuf);
+  }
+}
+
+// What is already on screen - a 5s poll that changes nothing must repaint
+// nothing (repainting is what makes a TFT flicker). Codex only uses n1/t1: its
+// second window no longer exists.
+struct HalfCache {
+  String n1, t1, n2, t2;
+  bool working = false;
+};
+HalfCache cacheClaude, cacheCodex;
+
+bool appWorking(bool isClaude) {
+  return isClaude ? claudeStatus.status == "working" : codexStatus.status == "working";
+}
+
+// Title line: logo (painted once), app name, status dot pinned to the right.
+// Green dot = working. Caller must have loadFont(Inter13) first.
+void drawTitle(int y, bool isClaude, HalfCache &c, bool force) {
+  if (force) {
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(C_WHITE, TFT_BLACK);
+    tft.drawString(isClaude ? "Claude" : "Codex", T_NAME_X, y + T_NAME_Y);
+  }
+  bool w = appWorking(isClaude);
+  if (!force && w == c.working) return;
+  c.working = w;
+  tft.fillCircle(T_DOT_X, y + T_DOT_Y, 4, w ? C_GREEN : C_TRACK);
+}
+
+// Label (static) + reset time, right-aligned on the number's line. Both sit on
+// the card fill, so the clear box is card-coloured, not black.
+// Caller must have loadFont(Inter13) first.
+void drawCardSmall(int cardY, const char *label, const String &time, String &cache, bool force) {
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_GREY, C_CARD);
+  if (force) tft.drawString(label, K_LAB_X, cardY + K_LAB_Y);
+  if (force || time != cache) {
+    cache = time;
+    tft.fillRect(K_TIME_R - 58, cardY + K_LAB_Y, 58, 15, C_CARD);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(time, K_TIME_R, cardY + K_LAB_Y);
+    tft.setTextDatum(TL_DATUM);
+  }
+}
+
+// The big percentage. Clear box x 48..142 - the label is left of it and the
+// reset time starts at 167 at the earliest, so it can eat neither.
+// Caller must have loadFont(Inter32) first.
+void drawCardBig(int cardY, const String &pct, String &cache, bool force) {
+  if (!force && pct == cache) return;
+  cache = pct;
+  tft.fillRect(K_NUM_X, cardY + K_NUM_Y, 94, 34, C_CARD);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_WHITE, C_CARD);
+  tft.drawString(pct, K_NUM_X, cardY + K_NUM_Y);
+}
+
+// Fonts are loaded once per layer, not per string: TFT_eSPI can only hold one
+// smooth font at a time, and each load mallocs seven small glyph-table arrays
+// (~800 bytes total for our 67 glyphs; the bitmaps themselves stay in PROGMEM).
+// Cheap, but not free, so a poll that changed nothing returns before touching
+// any of it - and most polls change nothing, since the numbers only move when a
+// quota or a reset minute does.
+void drawDualQuota(bool force) {
+  String n5 = pctText(claudeStatus.fiveHourPct);
+  String nw = pctText(claudeStatus.sevenDayPct);
+  String nx = pctText(codexStatus.primaryPct);
+  String t5 = resetText(claudeStatus.fiveHourResetMin);
+  String tw = resetText(claudeStatus.sevenDayResetMin);
+  String tx = resetText(codexStatus.primaryResetMin);
+  bool wc = appWorking(true), wx = appWorking(false);
+
+  if (!force && n5 == cacheClaude.n1 && nw == cacheClaude.n2 && nx == cacheCodex.n1 &&
+      t5 == cacheClaude.t1 && tw == cacheClaude.t2 && tx == cacheCodex.t1 &&
+      wc == cacheClaude.working && wx == cacheCodex.working) {
+    return; // nothing on this page changed
+  }
+
+  if (force) {
+    tft.fillScreen(TFT_BLACK);
+    drawLogoAt(claude_logo24_0, CLAUDE_LOGO24_W, CLAUDE_LOGO24_H, T_LOGO_X, TITLE1_Y);
+    drawLogoAt(codex_logo24_0, CODEX_LOGO24_W, CODEX_LOGO24_H, T_LOGO_X, TITLE2_Y);
+    tft.fillRoundRect(CARD_X, CARD1_Y, CARD_W, CARD_H, CARD_R, C_CARD);
+    tft.fillRoundRect(CARD_X, CARD2_Y, CARD_W, CARD_H, CARD_R, C_CARD);
+    tft.fillRoundRect(CARD_X, CARD3_Y, CARD_W, CARD_H, CARD_R, C_CARD);
+    tft.drawFastHLine(CARD_X, DIV_Y, CARD_W, C_TRACK);
+    cacheClaude = HalfCache();
+    cacheCodex = HalfCache();
+  }
+
+  tft.loadFont(Inter13);
+  drawTitle(TITLE1_Y, true, cacheClaude, force);
+  drawTitle(TITLE2_Y, false, cacheCodex, force);
+  drawCardSmall(CARD1_Y, "5H", t5, cacheClaude.t1, force);
+  drawCardSmall(CARD2_Y, "WK", tw, cacheClaude.t2, force);
+  drawCardSmall(CARD3_Y, "WK", tx, cacheCodex.t1, force);
+  tft.unloadFont();
+
+  tft.loadFont(Inter32);
+  drawCardBig(CARD1_Y, n5, cacheClaude.n1, force);
+  drawCardBig(CARD2_Y, nw, cacheClaude.n2, force);
+  drawCardBig(CARD3_Y, nx, cacheCodex.n1, force);
+  tft.unloadFont();
+
+  float c5 = claudeStatus.fiveHourPct, cw = claudeStatus.sevenDayPct, xw = codexStatus.primaryPct;
+  drawBar(CARD1_Y, c5 < 0 ? 0 : c5, C_ORANGE);
+  drawBar(CARD2_Y, cw < 0 ? 0 : cw, C_ORANGE);
+  drawBar(CARD3_Y, xw < 0 ? 0 : xw, C_BLUE);
+}
+
+// Bridge unreachable, or someone is waiting on an approval prompt: flash the
+// outermost 3px. It lives in the page's padding, so clearing it to black is
+// enough - no need to repaint the cards underneath. (The pet page uses the
+// quota ring itself for this; the dual page has no ring.)
+const int ALERT_W = 3;
+void drawAlertBorder(bool on) {
+  uint16_t c = on ? TFT_RED : TFT_BLACK;
+  tft.fillRect(0, 0, SCREEN_W, ALERT_W, c);
+  tft.fillRect(0, SCREEN_H - ALERT_W, SCREEN_W, ALERT_W, c);
+  tft.fillRect(0, 0, ALERT_W, SCREEN_H, c);
+  tft.fillRect(SCREEN_W - ALERT_W, 0, ALERT_W, SCREEN_H, c);
+}
+
+bool anyNeedsInput() { return claudeStatus.needsInput || codexStatus.needsInput; }
+
+// ---------- pet page ----------
 
 // Claude's ring percentage: real 5h OAuth quota from the bridge when known,
 // otherwise fall back to elapsed session time as a rough stand-in.
@@ -1326,7 +1536,9 @@ void pollBridge() {
   }
   http.end();
   DisplayMode eff = effectiveMode();
-  if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
+  if (eff == MODE_DUAL) {
+    drawDualQuota(false); // in place: only the numbers that changed repaint
+  } else if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
     // Only a real app switch clears the screen; a plain data refresh paints
     // in place so the poll doesn't flash the whole display.
     if (updateActiveApp()) drawActiveApp();
@@ -1354,6 +1566,13 @@ void showMainUiIfNeeded() {
   if (mainUiShown) return;
   mainUiShown = true;
   drawStaticChrome();
+  if (displayMode == MODE_DUAL) {
+    // Straight to the dual page, otherwise the pet flashes up for one frame
+    // before loop()'s mode-transition handler swaps it out.
+    lastEffectiveMode = MODE_DUAL;
+    drawDualQuota(true);
+    return;
+  }
   updateActiveApp();
   drawActiveApp();
 }
@@ -1371,7 +1590,9 @@ void handleSerialFrame(char *line) {
       everPolled = true;
       showMainUiIfNeeded();
       DisplayMode eff = effectiveMode();
-      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
+      if (eff == MODE_DUAL) {
+        drawDualQuota(false);
+      } else if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
         if (updateActiveApp()) drawActiveApp();
         else refreshActiveApp();
       }
@@ -1402,6 +1623,7 @@ void handleSerialFrame(char *line) {
       else if (m == "codex") displayMode = MODE_CODEX;
       else if (m == "net") displayMode = MODE_NET;
       else if (m == "music") displayMode = MODE_MUSIC;
+      else if (m == "dual") displayMode = MODE_DUAL;
       else if (m == "stock") displayMode = MODE_STOCK;
       // the effectiveMode transition handler in loop() repaints the chrome
     }
@@ -1524,6 +1746,7 @@ const char *displayModeName(DisplayMode m) {
   if (m == MODE_NET) return "net";
   if (m == MODE_MUSIC) return "music";
   if (m == MODE_STOCK) return "stock";
+  if (m == MODE_DUAL) return "dual";
   return "auto";
 }
 
@@ -1564,8 +1787,9 @@ void handleApiDisplay() {
   else if (mode == "net") displayMode = MODE_NET;
   else if (mode == "music") displayMode = MODE_MUSIC;
   else if (mode == "stock") displayMode = MODE_STOCK;
+  else if (mode == "dual") displayMode = MODE_DUAL;
   else {
-    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock");
+    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock|dual");
     return;
   }
   Serial.printf("[api] display mode = %s\n", mode.c_str());
@@ -1578,6 +1802,8 @@ void handleApiDisplay() {
   } else if (displayMode == MODE_STOCK) {
     stockChromeDrawn = false;
     lastStockPollMs = 0; // poll + draw on the next loop tick
+  } else if (displayMode == MODE_DUAL) {
+    drawDualQuota(true); // unconditional: also repaints over a previous net chart
   } else {
     updateActiveApp();
     drawActiveApp(); // unconditional: also repaints over a previous net chart
@@ -1652,7 +1878,10 @@ void handleSpriteReset(ActiveApp slot) {
   loadCustomSpriteState();
   if (slot == APP_CLAUDE) claudeFrame = 0;
   else codexFrame = 0;
-  if (currentApp == slot) drawActiveApp();
+  // The dual page carries no sprite, so a sprite change must not repaint the
+  // pet page over it. (updateActiveApp() still runs there, so currentApp is
+  // meaningful and this guard is what keeps the page intact.)
+  if (currentApp == slot && effectiveMode() != MODE_DUAL) drawActiveApp();
   webServer.send(200, "text/plain", "ok");
 }
 
@@ -1879,7 +2108,10 @@ void handleSpriteUploadDone(ActiveApp slot) {
   loadCustomSpriteState();
   if (slot == APP_CLAUDE) claudeFrame = 0;
   else codexFrame = 0;
-  if (currentApp == slot) drawActiveApp();
+  // The dual page carries no sprite, so a sprite change must not repaint the
+  // pet page over it. (updateActiveApp() still runs there, so currentApp is
+  // meaningful and this guard is what keeps the page intact.)
+  if (currentApp == slot && effectiveMode() != MODE_DUAL) drawActiveApp();
 
   if (ok) {
     webServer.send(200, "text/plain", "ok");
@@ -1983,6 +2215,8 @@ void loop() {
     } else if (eff == MODE_STOCK) {
       stockChromeDrawn = false;
       lastStockPollMs = 0;
+    } else if (eff == MODE_DUAL) {
+      drawDualQuota(true);
     } else {
       updateActiveApp();
       drawActiveApp();
@@ -2013,6 +2247,24 @@ void loop() {
       if (!wiredActive()) pollStock();
     }
     if (!stockChromeDrawn || stockDirty) drawStockScreen();
+  } else if (eff == MODE_DUAL) {
+    // dual quota page: nothing animates. Numbers repaint from onStatusUpdated()
+    // on each poll; the only moving thing here is the alert border.
+    static bool alertShown = false;
+    if (nowMs - lastFlashMs >= FLASH_INTERVAL_MS) {
+      lastFlashMs = nowMs;
+      flashOn = !flashOn;
+      if (bridgeStale() || anyNeedsInput()) {
+        drawAlertBorder(flashOn);
+        alertShown = true;
+      } else if (alertShown) {
+        drawAlertBorder(false); // alert cleared: wipe the border, cards stay
+        alertShown = false;
+      }
+    }
+    // Keeps currentApp meaningful for /api/info and the sprite-upload preview,
+    // even though this page paints both apps and never switches between them.
+    updateActiveApp();
   } else {
     // sprite walk-cycle animation (only advances while that app is showing)
     if (nowMs - lastAnimMs >= ANIM_INTERVAL_MS) {
