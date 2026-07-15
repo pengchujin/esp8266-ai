@@ -16,6 +16,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let codexUsageItem = NSMenuItem(title: "Codex …", action: nil, keyEquivalent: "")
     private let deviceInfoItem = NSMenuItem(title: "设备：未设置", action: nil, keyEquivalent: "")
     private var modeItems: [String: NSMenuItem] = [:]
+    private var appearanceNotification: NSObjectProtocol?
 
     init(service: StatusService, usage: UsageFetcher, netMonitor: NetSpeedMonitor,
          nowPlaying: NowPlayingMonitor, stockMonitor: StockMonitor, port: UInt16) {
@@ -27,23 +28,72 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         super.init()
         buildMenu()
         if let button = statusItem.button {
-            button.image = Self.retroMacIcon()
+            updateStatusIcon(for: button)
+            appearanceNotification = DistributedNotificationCenter.default().addObserver(
+                forName: Notification.Name("AppleInterfaceThemeChangedNotification"),
+                object: nil,
+                queue: .main
+            ) { [weak self, weak button] _ in
+                guard let self, let button else { return }
+                self.updateStatusIcon(for: button)
+            }
             button.target = self
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
     }
 
-    /// User-supplied device logo (bezel + dark screen + smiley + green status
-    /// dot). Full-color, so NOT a template image — it keeps its colors in
-    /// both light and dark menu bars.
-    private static func retroMacIcon() -> NSImage {
-        guard let img = Bundle.module.image(forResource: "happy-mac") else {
-            return NSImage(size: NSSize(width: 18, height: 18))
+    deinit {
+        if let appearanceNotification {
+            DistributedNotificationCenter.default().removeObserver(appearanceNotification)
         }
-        img.size = NSSize(width: 18, height: 18)
-        img.isTemplate = false
-        return img
+    }
+
+    private func updateStatusIcon(for button: NSStatusBarButton) {
+        button.image = Self.retroMacIcon(dark: Self.systemUsesDarkAppearance())
+        button.imagePosition = .imageOnly
+    }
+
+    static func systemUsesDarkAppearance(defaults: UserDefaults = .standard) -> Bool {
+        defaults.string(forKey: "AppleInterfaceStyle")?.caseInsensitiveCompare("Dark") == .orderedSame
+    }
+
+    /// Full-color adaptive icon. A template image would invert the requested
+    /// palette, so the two variants are drawn explicitly.
+    static func retroMacIcon(dark: Bool) -> NSImage {
+        let background = dark ? NSColor(calibratedWhite: 0.06, alpha: 1) : NSColor.white
+        let foreground = dark ? NSColor.white : NSColor.black
+        let border = dark ? NSColor(calibratedWhite: 0.92, alpha: 1) : NSColor.black
+
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            let bezel = NSBezierPath(roundedRect: NSRect(x: 1.25, y: 1.25, width: 15.5, height: 15.5),
+                                     xRadius: 3, yRadius: 3)
+            background.setFill()
+            bezel.fill()
+            border.setStroke()
+            bezel.lineWidth = 1.25
+            bezel.stroke()
+
+            foreground.setFill()
+            NSBezierPath(ovalIn: NSRect(x: 5.25, y: 10.4, width: 1.6, height: 1.6)).fill()
+            NSBezierPath(ovalIn: NSRect(x: 11.15, y: 10.4, width: 1.6, height: 1.6)).fill()
+
+            let smile = NSBezierPath()
+            smile.move(to: NSPoint(x: 5.6, y: 7.4))
+            smile.curve(to: NSPoint(x: 12.4, y: 7.4),
+                        controlPoint1: NSPoint(x: 7.2, y: 4.9),
+                        controlPoint2: NSPoint(x: 10.8, y: 4.9))
+            foreground.setStroke()
+            smile.lineWidth = 1.25
+            smile.lineCapStyle = .round
+            smile.stroke()
+
+            NSColor.systemGreen.setFill()
+            NSBezierPath(ovalIn: NSRect(x: 3.35, y: 13.25, width: 1.5, height: 1.5)).fill()
+            return true
+        }
+        image.isTemplate = false
+        return image
     }
 
     /// Left click -> mirror popover; right click -> control menu.
