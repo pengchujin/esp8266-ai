@@ -97,8 +97,8 @@ LaunchAgent（`~/Library/LaunchAgents/`）即可，未内置，按需再加。
 
 ## 2. 烧录 ESP8266 固件
 
-已确认的硬件：ESP8266EX（ESP-12S 模组）/ 4MB flash / CH340C 转串口，设备节点
-`/dev/cu.usbserial-130`。这是拼多多"WiFi天气时钟 MG01"成品板，本质是 oshwhub 上
+已确认的硬件：ESP8266EX（ESP-12S 模组）/ 4MB flash / CH340C 转串口，macOS 设备节点
+通常为 `/dev/cu.usbserial-XXXX`（后缀因设备而异）。这是拼多多"WiFi天气时钟 MG01"成品板，本质是 oshwhub 上
 ["SD2/小电视"开源方案](https://oshwhub.com/q21182889/sd2) 的量产版。
 
 **接线是厂家固定的，一体成型无法重接**，网上能搜到的几份"看起来像"的教程接线图实测
@@ -129,6 +129,26 @@ python3 -m venv .pio-venv && source .pio-venv/bin/activate
 pip install platformio
 pio run -t upload          # 已验证：编译成功，Flash 45.7%，RAM 39.7%
 ```
+
+只走 USB 串口、不使用 Wi-Fi 时，选择 `fubotv-usb` 构建目标。它会关闭 ESP8266
+无线射频、跳过配网和 Web 服务，并等待 Mac 端主动推送状态数据：
+
+```bash
+cd firmware
+pio run -e fubotv-usb -t upload
+
+cd ../mac-app
+AICLOCK_SERIAL_PORT=/dev/cu.usbserial-XXXX swift run
+```
+
+`AICLOCK_SERIAL_PORT` 是可选的；未设置时会自动扫描 CH340 串口。纯 USB 模式支持
+Claude / Codex 状态、额度、系统负载、股票数据、显示模式切换和亮度调节。亮度在纯 USB
+模式下只对本次开机有效；依赖 HTTP 的音乐封面、自定义 GIF 上传和设备 Web 管理页不可用。
+菜单栏镜像会根据设备每 5 秒返回的串口确认判断在线状态，不需要配置设备 IP；连续 15 秒
+没有确认才会显示离线。
+
+后台启动可使用 `mac-app/start-aiclock.sh`。脚本会按自身位置定位工程，首次启动时自动
+构建，并将日志写入 `~/Library/Logs/AIClockBridge/bridge.log`。
 
 烧录后串口会打印调试日志（这版固件不再是"静默"的）：
 

@@ -6,10 +6,13 @@ import Foundation
 // otherwise poll over HTTP, as newline-terminated frames:
 //   bridge -> device:  #HELLO   #STATUS {json}   #NET {json}   #CMD {json}
 //   device -> bridge:  #DEVICE {"name":"aiclock","fw":"x.y.z"}
+//                       #ACK status
 // Device log lines (anything not starting with '#') are ignored.
 //
-// NOTE: the port is opened non-exclusively so esptool/pio can still flash,
-// but quit the app before flashing to avoid the two readers fighting.
+// Set AICLOCK_SERIAL_PORT to pin the bridge to one device. The automatic scan
+// remains the default when the variable is absent.
+//
+// NOTE: quit the app before flashing so the two serial clients do not race.
 final class SerialLink {
     private let service: StatusService
     private let netMonitor: NetSpeedMonitor
@@ -18,6 +21,11 @@ final class SerialLink {
     private var fd: Int32 = -1
     private var portPath = ""
     private var linked = false // saw #DEVICE from the clock on this port
+    private var dataConfirmed = false // saw a parsed status acknowledgement
+    private var lastStatusConfirmedAt = Date.distantPast
+    private var displayMode = "auto"
+    private var brightness = 100
+    private var showing = "claude"
     private var openedAt = Date.distantPast
     private var lastHelloAt = Date.distantPast
     private var lastStatusAt = Date.distantPast
@@ -39,6 +47,51 @@ final class SerialLink {
     }
 
     var isLinked: Bool { linked }
+
+    var deviceInfo: DeviceInfo? {
+        guard linked, dataConfirmed,
+              Date().timeIntervalSince(lastStatusConfirmedAt) < 15 else { return nil }
+
+        let snapshot = service.snapshot()
+        if displayMode == "claude" || displayMode == "codex" {
+            showing = displayMode
+        } else if snapshot.claude.needsInput != snapshot.codex.needsInput {
+            showing = snapshot.claude.needsInput ? "claude" : "codex"
+        } else {
+            let claudeWorking = snapshot.claude.status == "working"
+            let codexWorking = snapshot.codex.status == "working"
+            if claudeWorking != codexWorking {
+                showing = claudeWorking ? "claude" : "codex"
+            }
+        }
+
+        var info = DeviceInfo()
+        info.ip = portPath
+        info.ssid = "USB"
+        info.bridge = "USB serial"
+        info.mode = displayMode
+        info.effective = displayMode
+        info.showing = showing
+        info.lastUpdateS = Int(Date().timeIntervalSince(lastStatusConfirmedAt))
+        info.brightness = brightness
+        return info
+    }
+
+    @discardableResult
+    func sendCommand(_ command: [String: Any]) -> Bool {
+        guard linked,
+              JSONSerialization.isValidJSONObject(command),
+              let json = try? JSONSerialization.data(withJSONObject: command) else { return false }
+        send(frame("#CMD ", json))
+        guard fd >= 0 else { return false }
+        if let mode = command["display"] as? String {
+            displayMode = mode
+        }
+        if let level = command["brightness"] as? Int {
+            brightness = max(0, min(100, level))
+        }
+        return true
+    }
 
     private func tick() {
         if fd < 0 {
@@ -81,6 +134,14 @@ final class SerialLink {
     // MARK: - port lifecycle
 
     private func scanAndOpen() {
+        if let configuredPort = ProcessInfo.processInfo.environment["AICLOCK_SERIAL_PORT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !configuredPort.isEmpty
+        {
+            _ = openPort(configuredPort)
+            return
+        }
+
         let names = (try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? []
         let candidates = names.filter {
             $0.hasPrefix("cu.usbserial") || $0.hasPrefix("cu.wchusbserial")
@@ -107,6 +168,11 @@ final class SerialLink {
         fd = f
         portPath = path
         linked = false
+        dataConfirmed = false
+        lastStatusConfirmedAt = .distantPast
+        displayMode = "auto"
+        brightness = 100
+        showing = "claude"
         openedAt = Date()
         lastHelloAt = .distantPast
         rxBuf.removeAll()
@@ -122,6 +188,8 @@ final class SerialLink {
         fd = -1
         portPath = ""
         linked = false
+        dataConfirmed = false
+        lastStatusConfirmedAt = .distantPast
     }
 
     // MARK: - I/O
@@ -157,6 +225,12 @@ final class SerialLink {
                     lastStatusAt = .distantPast // push a status immediately
                     lastNetAt = .distantPast
                     FileHandle.standardError.write(Data("[serial] linked \(portPath): \(line)\n".utf8))
+                }
+            } else if line == "#ACK status" {
+                lastStatusConfirmedAt = Date()
+                if !dataConfirmed {
+                    dataConfirmed = true
+                    FileHandle.standardError.write(Data("[serial] status data confirmed by device\n".utf8))
                 }
             }
             // anything else is the device's debug log - ignore

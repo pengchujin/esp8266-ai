@@ -1274,6 +1274,25 @@ void setupWiFi() {
   Serial.printf("[wifi] bridge host = '%s'\n", bridgeHost.c_str());
 }
 
+void setupWiredOnly() {
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  WiFi.forceSleepBegin();
+  delay(1);
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("USB mode", 8, 62, 4);
+  tft.drawString("Waiting for AIClockBridge", 8, 104, 2);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("Connect this device to Mac", 8, 132, 2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("Firmware v" FW_VERSION, 8, 215, 2);
+  Serial.println("[usb] wired-only mode, WiFi disabled");
+}
+
 bool parseStatusJson(const String &payload) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
@@ -1389,7 +1408,8 @@ void handleSerialFrame(char *line) {
   lastSerialFrameMs = millis();
   wiredEverLinked = true;
   if (!strncmp(line, "#HELLO", 6)) {
-    Serial.printf("#DEVICE {\"name\":\"aiclock\",\"fw\":\"%s\"}\n", FW_VERSION);
+    Serial.printf("#DEVICE {\"name\":\"aiclock\",\"fw\":\"%s\",\"transport\":\"%s\"}\n",
+                  FW_VERSION, AICLOCK_WIRED_ONLY ? "usb" : "hybrid");
     return;
   }
   if (!strncmp(line, "#STATUS ", 8)) {
@@ -1402,6 +1422,7 @@ void handleSerialFrame(char *line) {
         if (updateActiveApp()) drawActiveApp();
         else refreshActiveApp();
       }
+      Serial.println("#ACK status");
     }
     return;
   }
@@ -1419,7 +1440,9 @@ void handleSerialFrame(char *line) {
     if (doc["brightness"].is<int>()) {
       brightness = constrain(doc["brightness"].as<int>(), 0, 100);
       applyBrightness();
+#if !AICLOCK_WIRED_ONLY
       saveBrightness();
+#endif
     }
     const char *mode = doc["display"] | (const char *)nullptr;
     if (mode) {
@@ -1946,10 +1969,12 @@ void setupWebServer() {
 void setup() {
   Serial.setRxBufferSize(2048); // a serial #STATUS frame (~600B) must survive a slow draw
   Serial.begin(115200);
+#if !AICLOCK_WIRED_ONLY
   LittleFS.begin();
   loadBridgeHost();
   loadBrightness();
   loadCustomSpriteState();
+#endif
 
   tft.init();
   tft.setRotation(0);
@@ -1958,6 +1983,9 @@ void setup() {
   analogWriteRange(100); // duty maps 1:1 to a 0-100 percentage
   applyBrightness();
 
+#if AICLOCK_WIRED_ONLY
+  setupWiredOnly();
+#else
   setupWiFi();
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -1978,12 +2006,16 @@ void setup() {
   }
   // else: the config-portal screen stays up; either the user configures WiFi
   // (handled in loop) or serial #STATUS frames arrive and take the screen over
+#endif
 }
 
 void loop() {
+#if !AICLOCK_WIRED_ONLY
   wifiManager.process(); // keeps the config portal alive until WiFi is set up
+#endif
   pumpSerial();          // wired (USB) bridge frames
 
+#if !AICLOCK_WIRED_ONLY
   if (!webServerStarted && WiFi.status() == WL_CONNECTED) {
     // WiFi came up after boot (portal or slow AP); the portal has released
     // port 80 by now, so the admin server can bind it
@@ -1993,6 +2025,7 @@ void loop() {
     lastPollMs = 0; // poll the bridge right away
   }
   if (webServerStarted) webServer.handleClient();
+#endif
   if (!mainUiShown) return; // config-portal screen is up, nothing to animate
 
   unsigned long nowMs = millis();
@@ -2091,6 +2124,8 @@ void loop() {
   // (works around AP client isolation, and avoids double updates).
   if (nowMs - lastPollMs >= BRIDGE_POLL_INTERVAL_MS) {
     lastPollMs = nowMs;
+#if !AICLOCK_WIRED_ONLY
     if (!wiredActive()) pollBridge();
+#endif
   }
 }

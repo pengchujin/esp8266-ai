@@ -84,6 +84,16 @@ cd firmware && pio run -t upload   # 固件：编译 + USB 烧录
 cd mac-app && swift run            # Mac 桥接：本地跑起来
 ```
 
+只通过 USB 显示 Claude / Codex 状态时，使用纯 USB 构建目标。该版本不会启动 Wi-Fi、配网热点和板载 Web 服务：
+
+```bash
+cd firmware && pio run -e fubotv-usb -t upload
+cd ../mac-app && AICLOCK_SERIAL_PORT=/dev/cu.usbserial-XXXX swift run
+```
+
+重启电脑后需要后台启动时，可直接运行 `mac-app/start-aiclock.sh`；日志写入
+`~/Library/Logs/AIClockBridge/bridge.log`，不依赖固定的用户名或项目路径。
+
 硬件引脚表、屏幕驱动的坑、设备 HTTP API、GIF 板上解码架构等细节见 **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)**。
 
 硬件、固件、软件全部开源，拿去改、拿去做、拿去卖都行。

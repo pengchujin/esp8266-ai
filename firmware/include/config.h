@@ -1,5 +1,10 @@
 #pragma once
 
+// ---- Build profile ----
+#ifndef AICLOCK_WIRED_ONLY
+#define AICLOCK_WIRED_ONLY 0
+#endif
+
 // ---- Firmware version (shown on the first-time WiFi setup screen & /api/info) ----
 #define FW_VERSION "0.4.8"
 

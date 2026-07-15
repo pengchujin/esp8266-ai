@@ -1,8 +1,8 @@
 import Foundation
 
-// Talks to the ESP8266 clock's own HTTP API, so everything the device's web
-// page can do (switch display, set bridge host, upload/reset pet GIFs) is
-// available straight from the menu bar. Device address persists in defaults.
+// Talks to the ESP8266 clock over HTTP. Lightweight controls can fall back to
+// the wired serial command channel; file transfer and administration remain
+// HTTP-only. Device address persists in defaults.
 
 struct DeviceInfo {
     var ip = ""
@@ -24,6 +24,9 @@ final class DeviceClient {
     private static let hostKey = "device_host"
     private static let lastSeenKey = "device_last_seen"
 
+    static var wiredCommandHandler: (([String: Any]) -> Bool)?
+    static var wiredInfoProvider: (() -> DeviceInfo?)?
+
     static var host: String {
         get { UserDefaults.standard.string(forKey: hostKey) ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: hostKey) }
@@ -43,6 +46,10 @@ final class DeviceClient {
 
     /// GET /api/info
     static func fetchInfo(completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
+        if let info = wiredInfoProvider?() {
+            DispatchQueue.main.async { completion(.success(info)) }
+            return
+        }
         guard let base = baseURL else {
             completion(.failure(Self.noHostError))
             return
@@ -83,6 +90,10 @@ final class DeviceClient {
 
     /// POST /api/display  mode=auto|claude|codex|net|music
     static func setDisplayMode(_ mode: String, completion: @escaping (Error?) -> Void) {
+        if wiredCommandHandler?(["display": mode]) == true {
+            completion(nil)
+            return
+        }
         postForm(path: "api/display", fields: ["mode": mode], completion: completion)
     }
 
@@ -91,8 +102,12 @@ final class DeviceClient {
         postForm(path: "api/bridge", fields: ["host": bridgeHost], completion: completion)
     }
 
-    /// POST /api/brightness  level=0-100 (0 = backlight off); device persists it
+    /// Set brightness. HTTP persists it; wired mode applies it for this boot.
     static func setBrightness(_ level: Int, completion: @escaping (Error?) -> Void) {
+        if wiredCommandHandler?(["brightness": level]) == true {
+            completion(nil)
+            return
+        }
         postForm(path: "api/brightness", fields: ["level": String(level)], completion: completion)
     }
 
