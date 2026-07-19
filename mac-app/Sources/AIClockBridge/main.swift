@@ -45,10 +45,16 @@ service.musicPlayingProvider = { nowPlaying.snapshot.playing }
 
 let stockMonitor = StockMonitor()
 stockMonitor.start()
+let weatherMonitor = WeatherMonitor.shared
+weatherMonitor.start()
+let deepSeekMonitor = DeepSeekMonitor.shared
+deepSeekMonitor.start()
+ClockBackground.shared.start()
 
 // Wired fallback: if the clock is plugged in over USB, push status/net down
 // the serial line (works around AP client isolation; no WiFi setup needed).
-let serialLink = SerialLink(service: service, netMonitor: netMonitor, stockMonitor: stockMonitor)
+let serialLink = SerialLink(service: service, netMonitor: netMonitor, stockMonitor: stockMonitor,
+                            nowPlaying: nowPlaying)
 serialLink.start()
 
 let server = HTTPServer(port: port, routes: [
@@ -60,10 +66,16 @@ let server = HTTPServer(port: port, routes: [
     },
     "/music": { nowPlaying.jsonData() },
     "/stock": { stockMonitor.jsonData() },
+    "/weather": { weatherMonitor.jsonData() },
+    "/deepseek": { deepSeekMonitor.jsonData() },
 ], binaryRoutes: [
     "/music/cover.raw": { nowPlaying.coverRGB565 },
     "/music/text.raw": { nowPlaying.textRGB565 },
     "/stock/names.raw": { stockMonitor.namesRGB565() },
+    "/weather/name.raw": { weatherMonitor.nameRGB565() },
+    "/weather/hilo.raw": { weatherMonitor.hiloRGB565() },
+    "/date.raw": { DateStrip.rgb565() },
+    "/clockbg.raw": { ClockBackground.shared.rgb565() },
 ], postRoutes: [
     // Claude Code / Codex hooks push lifecycle events here (see README §7):
     // curl -d '{"agent":"claude","event":"PreToolUse"}' http://127.0.0.1:8765/event
@@ -80,7 +92,7 @@ let server = HTTPServer(port: port, routes: [
 // Remember it (for auto-pairing / DHCP-change self-healing) and adopt it
 // outright when no device is configured yet.
 server.onRequest = { path, ip in
-    guard path == "/status" || path == "/net" || path == "/music",
+    guard path == "/status" || path == "/net" || path == "/music" || path == "/weather" || path == "/deepseek",
           ip != "127.0.0.1", ip != "::1", !ip.isEmpty else { return }
     DeviceClient.devicePollAt = Date()
     DeviceClient.lastSeenIP = ip
@@ -102,6 +114,25 @@ do {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+
+// A main menu with a working Edit menu is required for keyboard shortcuts
+// (⌘A/⌘C/⌘V/⌘X) in text fields — without it, alerts like the DeepSeek key
+// input only accept mouse-right-click paste. The menu bar itself is hidden
+// in accessory mode; the Edit menu still drives the key equivalents.
+let mainMenu = NSMenu()
+let editMenuItem = NSMenuItem()
+mainMenu.addItem(editMenuItem)
+let editMenu = NSMenu(title: "Edit")
+editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+editMenu.addItem(.separator())
+editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+editMenuItem.submenu = editMenu
+app.mainMenu = mainMenu
+
 let menuBar = MenuBarController(service: service, usage: usage, netMonitor: netMonitor,
                                 nowPlaying: nowPlaying, stockMonitor: stockMonitor, port: port)
 _ = menuBar // retain

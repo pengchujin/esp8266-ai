@@ -63,6 +63,21 @@ final class NowPlayingMonitor {
         return _textRGB565
     }
 
+    /// (rev, bytes) pairs for the serial bulk push (SerialLink), so wired-only
+    /// devices get cover art and the CJK title strip without HTTP.
+    func coverStrip() -> (rev: Int, data: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (currentLocked().artworkRev, _coverRGB565)
+    }
+
+    func textStrip() -> (rev: Int, data: Data) {
+        renderTextIfNeeded()
+        lock.lock()
+        defer { lock.unlock() }
+        return (textRev, _textRGB565)
+    }
+
     init() {
         loadMediaRemote()
     }
