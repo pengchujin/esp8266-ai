@@ -86,6 +86,8 @@ final class MirrorView: NSView {
     var netMem = -1
     var stockMode = false
     var stockRows: [StockMonitor.Row] = []
+    var clockMode = false
+    var clockWallpaper = false // device says the clock page uses the wallpaper bg
     var netHeaderDL = "0B"
     var netHeaderUL = "0B"
     private static let netCols = 224 // NET_CHART_W
@@ -148,6 +150,11 @@ final class MirrorView: NSView {
         }
         if stockMode {
             drawStockScene()
+            ctx.restoreGState()
+            return
+        }
+        if clockMode {
+            drawClockScene()
             ctx.restoreGState()
             return
         }
@@ -379,6 +386,141 @@ final class MirrorView: NSView {
             ])
     }
 
+    // Mirrors the firmware's weather-clock page: the exact same composited
+    // wallpaper bitmap the device blits (ClockBackground), white HH / blinking
+    // colon / orange MM / small seconds, weather icon top-right, temp &
+    // humidity bars, DeepSeek balance bottom-left and the corner pet (same
+    // sprite frames as the pet page, 2:1 downscaled, black pixels masked out).
+    private func drawClockScene() {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+
+        // background — the very bytes the device fetched as /clockbg.raw
+        if clockWallpaper, let bg = decodeCover(ClockBackground.shared.rgb565(), w: 240, h: 240) {
+            ctx.saveGState()
+            ctx.interpolationQuality = .none
+            ctx.translateBy(x: 0, y: 120)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.translateBy(x: 0, y: -120)
+            ctx.draw(bg, in: CGRect(x: 0, y: 0, width: 240, height: 240))
+            ctx.restoreGState()
+        }
+
+        // big time, firmware layout: (wHH + wColon + wHH + gap + wSS) centered
+        let now = Date()
+        let cal = Calendar.current
+        let colon = cal.component(.second, from: now) % 2 == 0
+        let timeFont = NSFont.monospacedDigitSystemFont(ofSize: 44, weight: .bold)
+        let ssFont = NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
+        let wHH = ("22" as NSString).size(withAttributes: [.font: timeFont]).width
+        let wColon = (":" as NSString).size(withAttributes: [.font: timeFont]).width
+        let wSS = ("22" as NSString).size(withAttributes: [.font: ssFont]).width
+        let gap: CGFloat = 6
+        let x = (240 - (wHH + wColon + wHH + gap + wSS)) / 2
+        (String(format: "%02d", cal.component(.hour, from: now)) as NSString).draw(
+            at: NSPoint(x: x, y: 54), withAttributes: [.font: timeFont, .foregroundColor: NSColor.white])
+        if colon {
+            (":" as NSString).draw(at: NSPoint(x: x + wHH, y: 54), withAttributes: [
+                .font: timeFont, .foregroundColor: NSColor.white,
+            ])
+        }
+        (String(format: "%02d", cal.component(.minute, from: now)) as NSString).draw(
+            at: NSPoint(x: x + wHH + wColon, y: 54),
+            withAttributes: [.font: timeFont, .foregroundColor: NSColor.systemOrange])
+        (String(format: "%02d", cal.component(.second, from: now)) as NSString).draw(
+            at: NSPoint(x: x + wHH + wColon + wHH + gap, y: 86),
+            withAttributes: [.font: ssFont, .foregroundColor: NSColor.white])
+
+        // weather icon top-right: SF symbol standing in for the device's 32px icon
+        let wth = WeatherMonitor.shared.snapshot
+        if wth.ok {
+            let name: String
+            switch wth.code {
+            case 0, 1: name = "sun.max.fill"
+            case 2: name = "cloud.sun.fill"
+            case 3: name = "cloud.fill"
+            case 45, 48: name = "cloud.fog.fill"
+            case 51...67, 80...82: name = "cloud.rain.fill"
+            case 71...77, 85, 86: name = "cloud.snow.fill"
+            case 95...99: name = "cloud.bolt.fill"
+            default: name = "questionmark"
+            }
+            if let sym = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 26, weight: .regular)) {
+                let rect = NSRect(x: 196, y: 6, width: 32, height: 32)
+                let tinted = NSImage(size: rect.size, flipped: false) { r in
+                    sym.draw(in: r)
+                    NSColor.white.set()
+                    r.fill(using: .sourceAtop)
+                    return true
+                }
+                tinted.draw(in: rect)
+            }
+        }
+
+        // temp & humidity bars, left column (firmware rows at y=148 / y=172);
+        // values share one LEFT-aligned numbers column at x=96
+        func gaugeRow(_ y: CGFloat, _ frac: Double, _ color: NSColor, _ value: String) {
+            ctx.setFillColor(color.withAlphaComponent(0.9).cgColor)
+            ctx.fill(CGRect(x: 10, y: y + 4, width: 8, height: 8)) // glyph dot
+            let track = CGRect(x: 34, y: y + 3, width: 58, height: 9)
+            NSColor(white: 0.16, alpha: 1).setFill()
+            NSBezierPath(roundedRect: track, xRadius: 4, yRadius: 4).fill()
+            if frac >= 0 {
+                let w = max(2, 58 * CGFloat(min(1, frac)))
+                color.setFill()
+                NSBezierPath(roundedRect: CGRect(x: 34, y: y + 3, width: w, height: 9),
+                             xRadius: 4, yRadius: 4).fill()
+            }
+            (value as NSString).draw(at: NSPoint(x: 96, y: y - 1), withAttributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 15, weight: .semibold),
+                .foregroundColor: NSColor.white,
+            ])
+        }
+        gaugeRow(148, wth.ok ? (wth.temp + 10) / 50 : -1, .systemRed,
+                 wth.ok ? "\(Int(wth.temp.rounded()))°" : "--")
+        gaugeRow(172, wth.ok && wth.humidity >= 0 ? Double(wth.humidity) / 100 : -1, .systemGreen,
+                 wth.ok && wth.humidity >= 0 ? "\(wth.humidity)%" : "--")
+
+        // DeepSeek single line: dot + "DPS" (big) + "CNY" (small suffix) in
+        // the bar column, balance LEFT-aligned to the numbers column (x=96)
+        let ds = DeepSeekMonitor.shared.snapshot
+        let dotColor: NSColor = !ds.ok ? .darkGray : (ds.available ? .systemGreen : .systemRed)
+        dotColor.setFill()
+        ctx.fillEllipse(in: CGRect(x: 10, y: 208, width: 8, height: 8))
+        let dsGrey = NSColor(calibratedRed: 0.62, green: 0.75, blue: 0.9, alpha: 1)
+        ("DPS" as NSString).draw(at: NSPoint(x: 34, y: 204), withAttributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: dsGrey,
+        ])
+        (ds.currency as NSString).draw(at: NSPoint(x: 75, y: 213), withAttributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 8, weight: .medium),
+            .foregroundColor: dsGrey,
+        ])
+        ((ds.ok ? String(format: "%.2f", ds.balance) : "--") as NSString).draw(
+            at: NSPoint(x: 96, y: 204), withAttributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold),
+                .foregroundColor: NSColor.white,
+            ])
+
+        // corner pet: current app's frames scaled into the 80px bottom-right
+        // box, black pixels masked out so it floats over the wallpaper
+        if !frames.isEmpty {
+            let img = frames[min(frameIdx, frames.count - 1)]
+            let big = CGFloat(max(spriteW, spriteH))
+            let outW = CGFloat(spriteW) * 80 / big, outH = CGFloat(spriteH) * 80 / big
+            let rect = CGRect(x: 156 + (80 - outW) / 2, y: 160 + (80 - outH) / 2,
+                              width: outW, height: outH)
+            let masked = img.copy(maskingColorComponents: [0, 12, 0, 12, 0, 12]) ?? img
+            ctx.saveGState()
+            ctx.interpolationQuality = .none
+            ctx.translateBy(x: 0, y: rect.midY)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.translateBy(x: 0, y: -rect.midY)
+            ctx.draw(masked, in: rect)
+            ctx.restoreGState()
+        }
+    }
+
     // Stock watchlist, same 54px rows as the firmware: grey code (the mirror
     // can render the CJK name next to it), big white price, colored change.
     private func drawStockScene() {
@@ -440,7 +582,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private let stockMonitor: StockMonitor
     private let popover = NSPopover()
     private let mirror = MirrorView()
-    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐", "股票"],
+    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "时钟", "网速", "音乐", "股票"],
                                                  trackingMode: .selectOne, target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "连接设备中…")
     private let brightnessSlider = NSSlider(value: 100, minValue: 0, maxValue: 100,
@@ -476,6 +618,10 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
 
         modeControl.target = self
         modeControl.action = #selector(modeChanged)
+        // 7 tabs in a 316pt popover: smaller font + fixed segment widths so
+        // nothing gets squeezed or truncated
+        modeControl.font = NSFont.systemFont(ofSize: 11)
+        for i in 0..<modeControl.segmentCount { modeControl.setWidth(42, forSegment: i) }
         statusLabel.font = NSFont.systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.alignment = .center
@@ -595,11 +741,17 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 self.mirror.deviceOK = true
                 self.applyScene(info)
                 self.ensureSprite(info)
+                self.prefetchSprites(info)
                 self.syncBrightness(info)
-                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3,
-                               "music": 4, "stock": 5][info.mode] ?? 0
-                self.modeControl.selectedSegment = modeIdx
+                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "clock": 3, "net": 4,
+                               "music": 5, "stock": 6][info.mode] ?? 0
+                // don't yank the segment back while the user's own mode POST
+                // is still landing on the device
+                if Date().timeIntervalSince(self.lastModeChangeAt) > 2 {
+                    self.modeControl.selectedSegment = modeIdx
+                }
                 let modeText = info.mode == "auto" ? "自动切换"
+                    : info.mode == "clock" ? "时钟页"
                     : info.mode == "net" ? "网速曲线"
                     : info.mode == "music" ? "音乐播放" : "固定显示"
                 self.statusLabel.stringValue = "\(info.ip) · \(modeText) · 数据 \(info.bridge)"
@@ -629,6 +781,12 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         mirror.netMode = info.effective == "net"
         mirror.musicMode = info.effective == "music"
         mirror.stockMode = info.effective == "stock"
+        mirror.clockMode = info.effective == "clock"
+        if mirror.clockMode {
+            mirror.clockWallpaper = info.wallpaper
+            mirror.needsDisplay = true // tick() runs at 1Hz: wall clock + colon blink stay fresh
+            return
+        }
         if mirror.stockMode {
             mirror.stockRows = stockMonitor.snapshot
             mirror.needsDisplay = true
@@ -691,6 +849,21 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.spriteH = cached.h
             return
         }
+        fetchSlot(slot, w: w, h: h, rev: info.spriteRev)
+    }
+
+    // Background-warm the non-visible slot too, so switching Claude/Codex
+    // (or the clock corner pet following the duty app) has zero fetch wait.
+    private func prefetchSprites(_ info: DeviceInfo) {
+        let current = info.showing == "codex" ? "codex" : "claude"
+        let other = current == "codex" ? "claude" : "codex"
+        if let cached = spriteCache[other], cached.rev == info.spriteRev { return }
+        let w = other == "claude" ? info.claudeW : info.codexW
+        let h = other == "claude" ? info.claudeH : info.codexH
+        fetchSlot(other, w: w, h: h, rev: info.spriteRev)
+    }
+
+    private func fetchSlot(_ slot: String, w: Int, h: Int, rev: Int) {
         guard fetchingSlot != slot else { return }
         fetchingSlot = slot
         DeviceClient.fetchSpriteRaw(slot: slot) { [weak self] result in
@@ -699,7 +872,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             if case let .success(data) = result {
                 let frames = decodeSpriteFrames(data, w: w, h: h)
                 guard !frames.isEmpty else { return }
-                self.spriteCache[slot] = (info.spriteRev, frames, w, h)
+                self.spriteCache[slot] = (rev, frames, w, h)
                 if (self.lastInfo?.showing == "codex" ? "codex" : "claude") == slot {
                     self.mirror.frames = frames
                     self.mirror.spriteW = w
@@ -711,6 +884,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     private var flashCounter = 0
+    private var lastModeChangeAt = Date.distantPast
 
     private func animTick() {
         guard let info = lastInfo, !mirror.netMode else { return }
@@ -729,6 +903,12 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         }
 
         guard !mirror.frames.isEmpty else { return }
+        if mirror.clockMode {
+            // corner pet on the clock page: free-running, device cadence
+            mirror.frameIdx = (mirror.frameIdx + 1) % mirror.frames.count
+            mirror.needsDisplay = true
+            return
+        }
         let snap = service.snapshot()
         let working = info.showing == "codex"
             ? snap.codex.status == "working" : snap.claude.status == "working"
@@ -741,7 +921,59 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func modeChanged() {
-        let mode = ["auto", "claude", "codex", "net", "music", "stock"][max(0, modeControl.selectedSegment)]
+        let mode = ["auto", "claude", "codex", "clock", "net", "music", "stock"][max(0, modeControl.selectedSegment)]
+        lastModeChangeAt = Date()
+        // optimistic scene switch: repaint the mirror right away instead of
+        // waiting for the device round-trip, so tab switching feels instant
+        mirror.netMode = mode == "net"
+        mirror.musicMode = mode == "music"
+        mirror.stockMode = mode == "stock"
+        mirror.clockMode = mode == "clock"
+        mirror.clockWallpaper = true // will be corrected by the next tick()
+        if mirror.netMode { mirror.resetNetSweep() }
+        if mirror.musicMode {
+            let s = nowPlaying.snapshot
+            mirror.musicTitle = s.title
+            mirror.musicArtist = s.artist
+            mirror.musicElapsed = s.elapsed
+            mirror.musicDuration = s.duration
+            mirror.musicPlaying = s.playing
+            mirror.musicCover = decodeCover(nowPlaying.coverRGB565, w: 128, h: 128)
+        }
+        if mirror.stockMode { mirror.stockRows = stockMonitor.snapshot }
+        // 桌宠场景(claude/codex/auto)也做乐观更新：有缓存帧立即上屏 + 快照填额度环，
+        // 不等设备往返，消除与其他场景之间的切换卡顿。
+        if mode == "claude" || mode == "codex" || mode == "auto" {
+            let slot = mode == "codex" ? "codex" : "claude"
+            let snap = service.snapshot()
+            if mode != "auto" { mirror.showingClaude = (slot == "claude") }
+            if slot == "claude" {
+                let pct = snap.claude.fiveHourPct
+                    ?? (snap.claude.sessionWindowMin > 0
+                        ? 100.0 * Double(snap.claude.sessionMin) / Double(snap.claude.sessionWindowMin) : 0)
+                mirror.ringPct = pct
+                mirror.line1 = "5h " + Self.pctText(pct)
+                mirror.line2 = "Weekly " + Self.pctText(snap.claude.sevenDayPct)
+                mirror.needsInput = snap.claude.needsInput
+            } else {
+                mirror.ringPct = snap.codex.primaryPct ?? snap.codex.weeklyPct ?? 0
+                if snap.codex.primaryPct == nil, snap.codex.weeklyPct != nil {
+                    mirror.line1 = "Weekly " + Self.pctText(snap.codex.weeklyPct)
+                    mirror.line2 = ""
+                } else {
+                    mirror.line1 = "5h " + Self.pctText(snap.codex.primaryPct)
+                    mirror.line2 = "Weekly " + Self.pctText(snap.codex.weeklyPct)
+                }
+                mirror.needsInput = snap.codex.needsInput
+            }
+            let key = mirror.showingClaude ? "claude" : "codex"
+            if let cached = spriteCache[key] {
+                mirror.frames = cached.frames
+                mirror.spriteW = cached.w
+                mirror.spriteH = cached.h
+            }
+        }
+        mirror.needsDisplay = true
         DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
     }
 }

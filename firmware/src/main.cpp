@@ -15,12 +15,14 @@
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 #include <AnimatedGIF.h>
+#include <time.h>
 
 #include "config.h"
 #include "img/claude_sprite.h"
 #include "img/codex_sprite.h"
 #include "img/claude_logo.h"
 #include "img/codex_logo.h"
+#include "img/weather_icons.h"
 
 TFT_eSPI tft = TFT_eSPI();
 ESP8266WebServer webServer(80);
@@ -73,8 +75,8 @@ unsigned long lastSwitchMs = 0;
 // Display override, settable from the Mac app via POST /api/display:
 // auto = follow working status, claude/codex = pin that app on screen,
 // net/music = show Mac-side telemetry pages instead of the pet.
-enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC, MODE_STOCK };
-DisplayMode displayMode = MODE_AUTO;
+enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC, MODE_STOCK, MODE_CLOCK };
+DisplayMode displayMode = MODE_CLOCK; // default: weather clock page
 
 // When AUTO and the Mac reports audio playing, the screen auto-switches to the
 // music page and back when it stops — same spirit as the Claude/Codex auto
@@ -149,6 +151,21 @@ int musicTextRev = -1;
 bool musicHasArtwork = false;
 bool musicChromeDrawn = false;
 unsigned long lastMusicPollMs = 0;
+
+// Wired (serial) music art: the bridge pushes cover + title strip as
+// #COVER/#MTEXT bulk transfers that land in LittleFS and blit from there
+// (the WiFi path fetches /music/cover.raw + /music/text.raw instead).
+const char *COVER_TMP = "/cover.tmp";
+const char *COVER_FILE = "/cover.bin";
+const char *MTEXT_TMP = "/mtext.tmp";
+const char *MTEXT_FILE = "/mtext.bin";
+const size_t MUSIC_COVER_BYTES = 128 * 128 * 2;
+const size_t MUSIC_TEXT_BYTES = 232 * 44 * 2;
+int coverFileRev = -1; // rev stored in COVER_FILE (-1 = none this boot)
+int mtextFileRev = -1; // rev stored in MTEXT_FILE
+bool musicCoverDirty = false, musicTextDirty = false;
+bool coverEverDrawn = false, mtextEverDrawn = false;
+bool blitMusicFile(const char *path, int x, int y, int w, int h); // defined with the wired bulk receiver
 
 int claudeFrame = 0;
 int codexFrame = 0;
@@ -1034,20 +1051,7 @@ void drawMusicTextFallback() {
 // Regions repaint independently: cover / text strip only when their rev
 // changes, progress bar + time on every poll (partial fill, no flicker
 // elsewhere).
-void drawMusicScreen(bool coverChanged, bool textChanged) {
-  if (!musicChromeDrawn) {
-    tft.fillScreen(TFT_BLACK);
-    coverChanged = true;
-    textChanged = true;
-    musicChromeDrawn = true;
-  }
-  if (coverChanged) {
-    if (!drawMusicCoverFromBridge()) drawMusicCoverPlaceholder();
-  }
-  if (textChanged) {
-    if (!drawMusicTextFromBridge()) drawMusicTextFallback();
-  }
-
+void drawMusicProgress() {
   const int bx = 20, by = 204, bw = 200, bh = 8;
   tft.fillRect(0, by - 2, SCREEN_W, SCREEN_H - by + 2, TFT_BLACK);
   tft.fillRect(bx, by, bw, bh, TFT_DARKGREY);
@@ -1061,6 +1065,81 @@ void drawMusicScreen(bool coverChanged, bool textChanged) {
   tft.drawString(timeText(musicElapsed) + " / " + timeText(musicDuration), SCREEN_CX, 220, 1);
 }
 
+void drawMusicScreen(bool coverChanged, bool textChanged) {
+  if (!musicChromeDrawn) {
+    tft.fillScreen(TFT_BLACK);
+    coverChanged = true;
+    textChanged = true;
+    musicChromeDrawn = true;
+  }
+  if (coverChanged) {
+    if (!drawMusicCoverFromBridge()) drawMusicCoverPlaceholder();
+  }
+  if (textChanged) {
+    if (!drawMusicTextFromBridge()) drawMusicTextFallback();
+  }
+  drawMusicProgress();
+}
+
+// Shared field update for the /music payload (HTTP poll) and the wired
+// "#MUSIC " frame; reports which revs moved so the caller can repaint.
+bool applyMusicJson(const String &json, bool *coverChanged, bool *textChanged) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) return false;
+  musicTitle = doc["title"] | "";
+  musicArtist = doc["artist"] | "";
+  musicAlbum = doc["album"] | "";
+  musicPlaying = doc["playing"] | false;
+  statusMusicPlaying = musicPlaying; // fast stop-detection while music shows
+  musicElapsed = doc["elapsed"] | 0;
+  musicDuration = doc["duration"] | 0;
+  musicHasArtwork = doc["has_artwork"] | false;
+  int rev = doc["artwork_rev"] | -1;
+  *coverChanged = rev != musicArtworkRev;
+  musicArtworkRev = rev;
+  int tRev = doc["text_rev"] | -1;
+  *textChanged = tRev != musicTextRev;
+  musicTextRev = tRev;
+  return true;
+}
+
+// Wired-mode music page: metadata arrives as #MUSIC frames, cover + text
+// strip as #COVER/#MTEXT bulk pushes into LittleFS. Progress updates every
+// frame; art repaints when its file catches up to the wanted rev (the old
+// art stays up while a push is in flight — no placeholder flash).
+void drawMusicScreenWired() {
+  if (!musicChromeDrawn) {
+    tft.fillScreen(TFT_BLACK);
+    musicChromeDrawn = true;
+    musicCoverDirty = true;
+    musicTextDirty = true;
+  }
+  if (musicCoverDirty) {
+    musicCoverDirty = false;
+    if (!musicHasArtwork) {
+      drawMusicCoverPlaceholder();
+      coverEverDrawn = true;
+    } else if (coverFileRev == musicArtworkRev &&
+               blitMusicFile(COVER_FILE, (SCREEN_W - MUSIC_COVER_W) / 2, 14, MUSIC_COVER_W, MUSIC_COVER_H)) {
+      coverEverDrawn = true;
+    } else if (!coverEverDrawn) {
+      drawMusicCoverPlaceholder();
+      coverEverDrawn = true;
+    }
+  }
+  if (musicTextDirty) {
+    musicTextDirty = false;
+    if (mtextFileRev == musicTextRev &&
+        blitMusicFile(MTEXT_FILE, MUSIC_TEXT_X, MUSIC_TEXT_Y, MUSIC_TEXT_W, MUSIC_TEXT_H)) {
+      mtextEverDrawn = true;
+    } else if (!mtextEverDrawn) {
+      drawMusicTextFallback();
+      mtextEverDrawn = true;
+    }
+  }
+  drawMusicProgress();
+}
+
 void pollMusic() {
   if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
   WiFiClient client;
@@ -1070,24 +1149,9 @@ void pollMusic() {
   if (!http.begin(client, url)) return;
   int code = http.GET();
   if (code == HTTP_CODE_OK) {
-    JsonDocument doc;
-    if (!deserializeJson(doc, http.getString())) {
-      musicTitle = doc["title"] | "";
-      musicArtist = doc["artist"] | "";
-      musicAlbum = doc["album"] | "";
-      musicPlaying = doc["playing"] | false;
-      statusMusicPlaying = musicPlaying; // fast stop-detection while music shows
-      musicElapsed = doc["elapsed"] | 0;
-      musicDuration = doc["duration"] | 0;
-      musicHasArtwork = doc["has_artwork"] | false;
-      int rev = doc["artwork_rev"] | -1;
-      bool coverChanged = rev != musicArtworkRev;
-      musicArtworkRev = rev;
-      int tRev = doc["text_rev"] | -1;
-      bool textChanged = tRev != musicTextRev;
-      musicTextRev = tRev;
+    bool coverChanged = false, textChanged = false;
+    if (applyMusicJson(http.getString(), &coverChanged, &textChanged))
       drawMusicScreen(coverChanged, textChanged);
-    }
   }
   http.end();
 }
@@ -1233,6 +1297,613 @@ void drawStockScreen() {
   }
 }
 
+// ---------- clock mode (SNTP wall clock; works without the bridge) ----------
+// Time comes from the ESP8266 core's built-in SNTP (configTime) once WiFi is
+// up; in wired-only mode (no WiFi -> no SNTP) the bridge pushes an "epoch"
+// field inside /status (and #STATUS) that we settimeofday() from instead.
+// The clock page deliberately never red-flashes on bridge loss: a stale
+// bridge is not an alert condition for a wall clock.
+const unsigned long CLOCK_TICK_MS = 500; // 2Hz tick -> 1Hz colon blink
+bool ntpConfigured = false;
+bool clockChromeDrawn = false;
+String clockLastTime, clockLastDate;
+unsigned long lastClockTickMs = 0;
+bool clockColonOn = true;
+
+void setupNtp() {
+  if (ntpConfigured) return;
+  configTime(CLOCK_TZ, CLOCK_NTP_SERVER1, CLOCK_NTP_SERVER2);
+  ntpConfigured = true;
+  Serial.println("[clock] SNTP configured, tz=" CLOCK_TZ);
+}
+
+// Bridge-supplied epoch. Accept only sane values so a garbage payload can't
+// scramble the display.
+void setClockFromEpoch(long epoch) {
+  if (epoch < 1700000000L) return; // before 2023-11: clearly bogus
+  timeval tv;
+  tv.tv_sec = epoch;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+}
+
+bool clockTimeValid() { return time(nullptr) > 1700000000L; }
+
+// ASCII-only: the panel fonts have no CJK glyphs. FONT7 is a 48px 7-segment
+// face containing digits, '-' and ':' - perfect for HH:MM. The colon blinks
+// at 1Hz as the seconds indicator. Repaints are change-detected, so a steady
+// minute only draws once; the blink only repaints 5 glyphs.
+const char *WEEKDAY_EN[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+
+// ---------- weather (clock page companion) ----------
+// Data comes from the bridge (GET /weather + /weather/name.raw); the bridge
+// fetches Open-Meteo every 10 minutes. The clock page polls it every 60s
+// while visible and degrades to "--" when the bridge has no weather (old
+// bridge, offline, wired-only mode). The CJK city/condition text arrives as a
+// bridge-rendered RGB565 strip, same trick as stock names / music titles.
+const unsigned long WEATHER_POLL_INTERVAL_MS = 60000;
+
+// Clock page v3, modeled on the reference product face (black, no hairlines):
+// top-left city/condition strip + "最高33° 最低26°" strip, colored icon
+// top-right; center: big white HH + blinking colon + orange MM + small
+// seconds; "7月25日 周一" date strip; then data rows (glyph + rounded bar +
+// value): temperature, humidity, agent 5H, agent WK; DeepSeek line at bottom.
+const int WEATHER_NAME_W = 108, WEATHER_NAME_H = 16;
+const int WEATHER_HILO_W = 108, WEATHER_HILO_H = 16;
+const int DATE_STRIP_W = 120, DATE_STRIP_H = 16;
+const int CITY_STRIP_X = 16, CITY_STRIP_Y = 8;
+const int HILO_STRIP_X = 16, HILO_STRIP_Y = 28;
+const int WEATHER_ICON_X = 196, WEATHER_ICON_Y = 6;
+const int CLOCK_TIME_Y = 52;
+const int DATE_STRIP_X = 16, DATE_STRIP_Y = 108;
+const int ROW_LABEL_X = 10;
+const int ROW_BAR_X = 34, ROW_BAR_W = 58, ROW_BAR_H = 9;
+const int ROW_VAL_X = 96; // LEFT edge of every value (temp, humidity, DS balance)
+
+// Corner pet on the clock page: the current app's sprite (custom upload or
+// built-in) downscaled into the bottom-right box, floating over the
+// wallpaper (pure-black pixels transparent). Left column keeps the data rows.
+const int PET_BOX = 80;
+const int PET_X = 240 - PET_BOX - 4;  // 156
+const int PET_Y = 240 - PET_BOX;      // 160, flush with the bottom edge
+int clockPetFrame = 0;
+unsigned long lastClockPetMs = 0;
+
+
+// ---------- desktop wallpaper background (clock page) ----------
+// The bridge composites the Mac's current desktop wallpaper (aspect-fill,
+// darkened for legibility) plus the CJK text lines into one
+// 240x240 RGB565 bitmap, served as /clockbg.raw with bg_rev inside /weather
+// (or pushed over serial as #BG frames when the wired link owns the path).
+// Downloaded to LittleFS once per rev; every repaint then blits regions from
+// that file instead of filling black. Off or unavailable -> plain black.
+const char *CLOCKBG_FILE = "/bg.bin";
+const char *WALLPAPER_CFG = "/wallpaper.cfg";
+const size_t CLOCKBG_BYTES = 240 * 240 * 2;
+bool wallpaperOn = true;     // user toggle (device web page)
+bool wallpaperReady = false; // /bg.bin exists and is complete
+int bgRev = -1;              // newest rev the bridge reported
+int bgDrawnRev = -1;         // rev currently stored in /bg.bin
+unsigned long lastBgTryMs = 0;
+unsigned long lastBgNeedMs = 0; // wired-mode #NEED re-request pacing
+
+void blitBg(int x, int y, int w, int h); // defined below, next to the bg file
+bool wiredActive();       // defined below with the wired serial link section
+extern int fileRxType;    // serial bulk file transfer in progress (0=none)
+
+void loadWallpaperCfg() {
+  wallpaperReady = false;
+  if (LittleFS.exists(WALLPAPER_CFG)) {
+    File f = LittleFS.open(WALLPAPER_CFG, "r");
+    if (f) {
+      wallpaperOn = f.readStringUntil('\n').toInt() != 0;
+      bgDrawnRev = f.readStringUntil('\n').toInt();
+      f.close();
+    }
+  }
+  if (LittleFS.exists(CLOCKBG_FILE)) {
+    File f = LittleFS.open(CLOCKBG_FILE, "r");
+    if (f) {
+      wallpaperReady = (size_t)f.size() == CLOCKBG_BYTES;
+      f.close();
+    }
+  }
+  if (!wallpaperReady) bgDrawnRev = -1; // refetch after any truncation
+  Serial.printf("[wallpaper] on=%d ready=%d rev=%d\n", wallpaperOn, wallpaperReady, bgDrawnRev);
+}
+
+void saveWallpaperCfg() {
+  File f = LittleFS.open(WALLPAPER_CFG, "w");
+  if (!f) return;
+  f.println(wallpaperOn ? 1 : 0);
+  f.println(bgDrawnRev);
+  f.close();
+}
+
+// Downloads the composited background into LittleFS: 115200 bytes, one
+// screen row at a time (rowBuf is exactly 240*2 bytes).
+bool downloadWallpaper() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/clockbg.raw";
+  http.setTimeout(20000); // far longer than the 2s poll timeout: 115KB body
+  if (!http.begin(client, url)) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+  File f = LittleFS.open(CLOCKBG_FILE, "w");
+  if (!f) {
+    http.end();
+    return false;
+  }
+  WiFiClient *stream = http.getStreamPtr();
+  size_t total = 0;
+  bool ok = true;
+  while (total < CLOCKBG_BYTES) {
+    size_t want = min((size_t)(240 * 2), CLOCKBG_BYTES - total);
+    if (stream->readBytes((uint8_t *)rowBuf, want) != (int)want) {
+      ok = false;
+      break;
+    }
+    f.write((uint8_t *)rowBuf, want);
+    total += want;
+    yield();
+  }
+  f.close();
+  http.end();
+  if (!ok) LittleFS.remove(CLOCKBG_FILE);
+  Serial.printf("[wallpaper] download %s (%u bytes)\n", ok ? "ok" : "FAILED", (unsigned)total);
+  return ok;
+}
+
+// Fills a region from the composited background, or plain black when the
+// wallpaper is off/unavailable. Drop-in replacement for fillRect(TFT_BLACK).
+void blitBg(int x, int y, int w, int h) {
+  if (wallpaperOn && wallpaperReady) {
+    File f = LittleFS.open(CLOCKBG_FILE, "r");
+    if (f) {
+      bool ok = true;
+      for (int r = 0; r < h; r++) {
+        f.seek(((size_t)(y + r) * 240 + x) * 2);
+        if (f.read((uint8_t *)rowBuf, (size_t)w * 2) != (int)((size_t)w * 2)) {
+          ok = false;
+          break;
+        }
+        tft.pushImage(x, y + r, w, 1, rowBuf);
+        if ((r & 31) == 31) yield();
+      }
+      f.close();
+      if (ok) return;
+    }
+  }
+  tft.fillRect(x, y, w, h, TFT_BLACK);
+}
+
+// Draws one frame of the current app's pet animation scaled (nearest, any
+// ratio) into the bottom-right corner box. Each screen row is COMPOSITED in
+// RAM first — background row from the wallpaper, then the sprite's non-black
+// pixels laid over it — and pushed exactly once. No bg-then-sprite two-pass,
+// so the pet never flickers even at the 120ms walk-cycle cadence.
+void drawClockPet(int app, int frameIdx) {
+  bool custom = (app == APP_CLAUDE) ? claudeCustom : codexCustom;
+  const char *file = (app == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
+  const uint16_t *const *frames = (app == APP_CLAUDE) ? claude_sprite_frames : codex_sprite_frames;
+  int w = (app == APP_CLAUDE) ? CLAUDE_SPRITE_W : CODEX_SPRITE_W;
+  int h = (app == APP_CLAUDE) ? CLAUDE_SPRITE_H : CODEX_SPRITE_H;
+  size_t frameBytes = (app == APP_CLAUDE) ? CLAUDE_FRAME_BYTES : CODEX_FRAME_BYTES;
+  int big = max(w, h);
+  int outW = (int)(((long)w * PET_BOX) / big), outH = (int)(((long)h * PET_BOX) / big);
+  int xRel = (PET_BOX - outW) / 2, yRel = (PET_BOX - outH) / 2;
+  bool bgActive = wallpaperOn && wallpaperReady;
+
+  File bgf, f;
+  bool bgOk = false;
+  if (bgActive) {
+    bgf = LittleFS.open(CLOCKBG_FILE, "r");
+    bgOk = (bool)bgf;
+  }
+  if (custom) {
+    f = LittleFS.open(file, "r");
+    if (!f) {
+      if (bgf) bgf.close();
+      return;
+    }
+  }
+  for (int r = 0; r < PET_BOX; r++) {
+    // 1) background row (or plain black when the wallpaper is off)
+    if (bgOk) {
+      bgf.seek(((size_t)(PET_Y + r) * 240 + PET_X) * 2);
+      if (bgf.read((uint8_t *)rowBuf, PET_BOX * 2) != PET_BOX * 2) bgOk = false;
+    }
+    if (!bgOk) memset(rowBuf, 0, PET_BOX * 2);
+    // 2) overlay the sprite row's non-black pixels
+    int ry = r - yRel;
+    if (ry >= 0 && ry < outH) {
+      int sr = (int)(((long)ry * h) / outH); // nearest source row
+      bool got;
+      if (custom) {
+        f.seek(1 + (size_t)frameIdx * frameBytes + (size_t)sr * w * 2);
+        got = f.read((uint8_t *)prevRowBuf, (size_t)w * 2) == (int)((size_t)w * 2);
+      } else {
+        memcpy_P(prevRowBuf, frames[frameIdx] + (size_t)sr * w, (size_t)w * 2);
+        got = true;
+      }
+      if (got) {
+        for (int c = 0; c < outW; c++) {
+          uint16_t v = prevRowBuf[(int)(((long)c * w) / outW)];
+          if (v != 0x0000) rowBuf[xRel + c] = v; // black = transparent
+        }
+      }
+    }
+    tft.pushImage(PET_X, PET_Y + r, PET_BOX, 1, rowBuf);
+  }
+  if (bgf) bgf.close();
+  if (custom) f.close();
+}
+const int ROW_TEMP_Y = 148, ROW_HUM_Y = 172;
+const int DS_Y = 204; // single-line DeepSeek row: dot + DPS CNY + balance
+
+bool weatherEverLoaded = false;
+int weatherCode = -1; // WMO weather code from the bridge; -1 = no data
+float weatherTempC = 0;
+float weatherTMax = 0, weatherTMin = 0;
+int weatherHumidity = -1;
+int weatherNameRev = -1, weatherNameDrawnRev = -1;
+int weatherHiloRev = -1, weatherHiloDrawnRev = -1;
+int dateDrawnRev = -1; // local-date rev of the drawn date strip
+unsigned long lastWeatherPollMs = 0;
+// strip fetch retry pacing: an unreachable bridge must not stall the 2Hz tick
+unsigned long lastNameTryMs = 0, lastHiloTryMs = 0, lastDateTryMs = 0;
+
+// ---------- DeepSeek balance (clock page companion) ----------
+// DeepSeek is pay-as-you-go, so the bridge reports the remaining account
+// balance (GET /deepseek, or a serial #DEEPSEEK frame when wired). Refreshed
+// every 5 minutes bridge-side; shown as one small line on the clock page.
+bool dsEverLoaded = false;
+bool dsAvailable = false;
+float dsBalance = 0;
+char dsCurrency[4] = "CNY";
+
+// Shared parser for the /deepseek JSON, reached via HTTP poll or serial.
+bool handleDeepSeekPayload(const String &json) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) return false;
+  dsEverLoaded = doc["ok"] | false;
+  dsAvailable = doc["avail"] | false;
+  dsBalance = doc["bal"] | 0.0f;
+  strlcpy(dsCurrency, doc["cur"] | "CNY", sizeof(dsCurrency));
+  return true;
+}
+
+void pollDeepSeek() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/deepseek";
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) return;
+  int code = http.GET();
+  if (code == HTTP_CODE_OK) handleDeepSeekPayload(http.getString());
+  http.end();
+}
+
+int weatherIconIndex(int code) {
+  if (code < 0) return 7;                          // unknown
+  if (code <= 1) return 0;                         // clear / mainly clear
+  if (code == 2) return 1;                         // partly cloudy
+  if (code == 3) return 2;                         // overcast
+  if (code == 45 || code == 48) return 3;          // fog
+  if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) return 4; // rain
+  if ((code >= 71 && code <= 77) || code == 85 || code == 86) return 5;   // snow
+  if (code >= 95) return 6;                        // thunderstorm
+  return 7;
+}
+
+void drawWeatherIcon(int idx) {
+  const uint16_t *icon = weather_icons[idx];
+  bool transparent = wallpaperOn && wallpaperReady; // black pixels float over wallpaper
+  for (int r = 0; r < WEATHER_ICON_H; r++) {
+    memcpy_P(rowBuf, icon + (size_t)r * WEATHER_ICON_W, WEATHER_ICON_W * 2);
+    if (transparent) tft.pushImage(WEATHER_ICON_X, WEATHER_ICON_Y + r, WEATHER_ICON_W, 1, rowBuf, TFT_BLACK);
+    else tft.pushImage(WEATHER_ICON_X, WEATHER_ICON_Y + r, WEATHER_ICON_W, 1, rowBuf);
+  }
+}
+
+// Streams a bridge-rendered RGB565 strip (fixed size, no count byte) and
+// blits it at (x, y) - used for the city, hi/lo and CJK date lines.
+bool fetchStrip(const char *path, int x, int y, int w, int h) {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + path;
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+  WiFiClient *stream = http.getStreamPtr();
+  const size_t rowBytes = (size_t)w * 2;
+  bool ok = true;
+  for (int r = 0; r < h; r++) {
+    if (stream->readBytes((uint8_t *)rowBuf, rowBytes) != (int)rowBytes) {
+      ok = false;
+      break;
+    }
+    tft.pushImage(x, y + r, w, 1, rowBuf);
+    yield();
+  }
+  http.end();
+  return ok;
+}
+
+// Shared parser for the /weather JSON, reached via HTTP poll or a serial
+// "#WEATHER " frame when the wired link owns the data path.
+bool handleWeatherPayload(const String &json) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) return false;
+  weatherEverLoaded = doc["ok"] | false;
+  weatherTempC = doc["temp"] | 0.0f;
+  weatherCode = doc["code"] | -1;
+  weatherHumidity = doc["humidity"] | -1;
+  weatherTMax = doc["tmax"] | 0.0f;
+  weatherTMin = doc["tmin"] | 0.0f;
+  weatherNameRev = doc["name_rev"] | -1;
+  weatherHiloRev = doc["hilo_rev"] | -1;
+  bgRev = doc["bg_rev"] | -1;
+  return true;
+}
+
+void pollWeather() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/weather";
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) return;
+  int code = http.GET();
+  if (code == HTTP_CODE_OK) handleWeatherPayload(http.getString());
+  Serial.printf("[weather] GET -> %d ok=%d temp=%.1f code=%d hum=%d\n", code, weatherEverLoaded,
+                weatherTempC, weatherCode, weatherHumidity);
+  http.end();
+}
+
+// Usage level -> bar color: green while comfortable, amber past half,
+// red past 80% (the pct is how much of the window is USED).
+uint16_t quotaBarColor(float pct) {
+  if (pct < 50) return TFT_GREEN;
+  if (pct < 80) return TFT_YELLOW;
+  return TFT_RED;
+}
+
+// Rounded data-row bar on a dark track; frac is 0..1, -1 = unknown (empty).
+void drawRowBar(int y, float frac, uint16_t color) {
+  tft.fillRoundRect(ROW_BAR_X, y + 3, ROW_BAR_W, ROW_BAR_H, 4, 0x2104);
+  if (frac < 0) return;
+  if (frac > 1) frac = 1;
+  int fw = (int)lroundf(ROW_BAR_W * frac);
+  if (fw >= 8) tft.fillRoundRect(ROW_BAR_X, y + 3, fw, ROW_BAR_H, 4, color);
+  else if (fw > 0) tft.fillRect(ROW_BAR_X, y + 3, fw, ROW_BAR_H, color);
+}
+
+// 7x9 droplet glyph (humidity row).
+void drawDroplet(int x, int y, uint16_t color) {
+  tft.fillTriangle(x + 3, y, x, y + 5, x + 6, y + 5, color);
+  tft.fillCircle(x + 3, y + 5, 3, color);
+}
+
+// 12x13 thermometer glyph (temperature row).
+void drawThermoGlyph(int x, int y, uint16_t color) {
+  tft.fillRoundRect(x + 4, y, 4, 8, 2, color); // stem
+  tft.fillCircle(x + 6, y + 9, 4, color);      // bulb
+}
+
+// Repaint detectors for the data-driven zones.
+int clockLastTempInt = -999, clockLastHumInt = -999;
+
+void drawClockScreen(bool force) {
+  if (!clockChromeDrawn) {
+    if (wallpaperOn && wallpaperReady) blitBg(0, 0, 240, 240);
+    else tft.fillScreen(TFT_BLACK);
+    clockChromeDrawn = true;
+    weatherNameDrawnRev = -1; // strip areas were wiped: re-fetch
+    weatherHiloDrawnRev = -1;
+    dateDrawnRev = -1;
+    clockLastTempInt = -999;
+    clockLastHumInt = -999;
+    force = true;
+  }
+
+  // --- background: refresh the composited wallpaper when bg_rev bumps ---
+  // (the CJK city/hi-lo/date lines are baked into that image, so when the
+  // wallpaper is active the per-strip fetches below are skipped)
+  unsigned long nowMs = millis();
+  if (wallpaperOn && bgRev >= 0 && bgRev != bgDrawnRev && nowMs - lastBgTryMs >= 30000UL &&
+      !wiredActive() && !fileRxType) { // wired: the serial #BG push owns this path
+    lastBgTryMs = nowMs;
+    if (downloadWallpaper()) {
+      bgDrawnRev = bgRev;
+      wallpaperReady = true;
+      saveWallpaperCfg();
+      clockChromeDrawn = false; // next tick repaints over the fresh background
+      return;
+    }
+  }
+  // Wired mode and out of sync (a push failed or the bridge restarted): ask
+  // the bridge for a re-push, paced to once a minute.
+  if (wallpaperOn && bgRev >= 0 && bgRev != bgDrawnRev && wiredActive() && !fileRxType &&
+      nowMs - lastBgNeedMs >= 60000UL) {
+    lastBgNeedMs = nowMs;
+    Serial.println("#NEED");
+  }
+  bool bgActive = wallpaperOn && wallpaperReady;
+
+  // --- center time: white HH + blinking colon + orange MM + small seconds ---
+  int tmYdayRev = -1;
+  char hh[3] = "--", mm[3] = "--", ss[3] = "--";
+  if (clockTimeValid()) {
+    struct tm tmNow;
+    time_t now = time(nullptr);
+    localtime_r(&now, &tmNow);
+    tmYdayRev = tmNow.tm_year * 400 + tmNow.tm_yday;
+    snprintf(hh, sizeof(hh), "%02d", tmNow.tm_hour);
+    snprintf(mm, sizeof(mm), "%02d", tmNow.tm_min);
+    snprintf(ss, sizeof(ss), "%02d", tmNow.tm_sec);
+  }
+  {
+    // Per-glyph repaint: only the digits that actually changed get their
+    // little background patch re-blitted and redrawn. The 1Hz seconds/colon
+    // touch ~30px instead of the whole row, so nothing visibly flashes.
+    int wHH = tft.textWidth("22", 7);
+    int wColon = tft.textWidth(":", 7);
+    int wSS = tft.textWidth("22", 2);
+    const int gap = 6;
+    int total = wHH + wColon + wHH + gap + wSS;
+    int x = (240 - total) / 2;
+    int xColon = x + wHH, xMM = xColon + wColon, xSS = xMM + wHH + gap;
+    static char lastHH[3] = "", lastMM[3] = "", lastSS[3] = "";
+    static bool lastColon = false;
+    if (force) { lastHH[0] = lastMM[0] = lastSS[0] = 0; lastColon = !clockColonOn; }
+    tft.setTextDatum(TL_DATUM);
+    if (strcmp(hh, lastHH) != 0) {
+      strcpy(lastHH, hh);
+      blitBg(x - 2, CLOCK_TIME_Y - 4, wHH + 4, 56);
+      tft.setTextColor(TFT_WHITE);
+      tft.drawString(hh, x, CLOCK_TIME_Y, 7);
+    }
+    if (clockColonOn != lastColon) {
+      lastColon = clockColonOn;
+      blitBg(xColon, CLOCK_TIME_Y - 4, wColon, 56);
+      if (clockColonOn) {
+        tft.setTextColor(TFT_WHITE);
+        tft.drawString(":", xColon, CLOCK_TIME_Y, 7);
+      }
+    }
+    if (strcmp(mm, lastMM) != 0) {
+      strcpy(lastMM, mm);
+      blitBg(xMM, CLOCK_TIME_Y - 4, wHH + 2, 56);
+      tft.setTextColor(TFT_ORANGE);
+      tft.drawString(mm, xMM, CLOCK_TIME_Y, 7);
+    }
+    if (strcmp(ss, lastSS) != 0) {
+      strcpy(lastSS, ss);
+      blitBg(xSS, CLOCK_TIME_Y + 28, wSS + 2, 24);
+      tft.setTextColor(TFT_WHITE);
+      tft.drawString(ss, xSS, CLOCK_TIME_Y + 32, 2);
+    }
+  }
+
+  // --- top-right icon slot: custom animation wins, else the weather icon ---
+  static int weatherDrawnIcon = -1;
+  static bool slotWasAnim = false;
+  if (force) {
+    weatherDrawnIcon = -1;
+    slotWasAnim = false;
+  }
+  {
+    int wantIcon = weatherEverLoaded ? weatherIconIndex(weatherCode) : 7;
+    if (wantIcon != weatherDrawnIcon || slotWasAnim) {
+      slotWasAnim = false;
+      weatherDrawnIcon = wantIcon;
+      blitBg(WEATHER_ICON_X - 4, WEATHER_ICON_Y - 4, 40, 40); // no chip: blend into the bg
+      drawWeatherIcon(wantIcon);
+    }
+  }
+
+  // --- CJK strips: only when the wallpaper background is OFF (when it's
+  // on, those lines are baked into the composited background image). Wired
+  // mode: strips arrive as #STRIP serial pushes instead of HTTP fetches. ---
+  if (!bgActive && !wiredActive() && weatherEverLoaded && weatherNameRev >= 0 &&
+      weatherNameDrawnRev != weatherNameRev && nowMs - lastNameTryMs >= 30000UL) {
+    lastNameTryMs = nowMs;
+    if (fetchStrip("/weather/name.raw", CITY_STRIP_X, CITY_STRIP_Y, WEATHER_NAME_W, WEATHER_NAME_H))
+      weatherNameDrawnRev = weatherNameRev;
+  }
+  if (!bgActive && !wiredActive() && weatherEverLoaded && weatherHiloRev >= 0 &&
+      weatherHiloDrawnRev != weatherHiloRev && nowMs - lastHiloTryMs >= 30000UL) {
+    lastHiloTryMs = nowMs;
+    if (fetchStrip("/weather/hilo.raw", HILO_STRIP_X, HILO_STRIP_Y, WEATHER_HILO_W, WEATHER_HILO_H))
+      weatherHiloDrawnRev = weatherHiloRev;
+  }
+  if (!bgActive && !wiredActive() && tmYdayRev >= 0 && tmYdayRev != dateDrawnRev &&
+      nowMs - lastDateTryMs >= 30000UL) {
+    lastDateTryMs = nowMs;
+    if (fetchStrip("/date.raw", DATE_STRIP_X, DATE_STRIP_Y, DATE_STRIP_W, DATE_STRIP_H))
+      dateDrawnRev = tmYdayRev;
+  }
+
+  // --- temperature row: thermo glyph + bar (-10..40C) + value (values are
+  // LEFT-aligned at ROW_VAL_X = 96, one shared numbers column) ---
+  int tInt = weatherEverLoaded ? (int)lroundf(weatherTempC) : -999;
+  if (force || tInt != clockLastTempInt) {
+    clockLastTempInt = tInt;
+    blitBg(0, ROW_TEMP_Y, PET_X, 20);
+    drawThermoGlyph(ROW_LABEL_X, ROW_TEMP_Y + 2, TFT_RED);
+    drawRowBar(ROW_TEMP_Y, tInt == -999 ? -1 : (weatherTempC + 10.0f) / 50.0f, TFT_RED);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_WHITE);
+    if (tInt == -999) {
+      tft.drawString("--", ROW_VAL_X, ROW_TEMP_Y, 2);
+    } else {
+      String t = String(tInt);
+      tft.drawString(t, ROW_VAL_X, ROW_TEMP_Y, 2);
+      tft.drawCircle(ROW_VAL_X + tft.textWidth(t, 2) + 3, ROW_TEMP_Y + 3, 2, TFT_WHITE); // degree dot
+    }
+  }
+
+  // --- humidity row: droplet glyph + bar (0..100%) + value ---
+  int hInt = weatherEverLoaded ? weatherHumidity : -1;
+  if (force || hInt != clockLastHumInt) {
+    clockLastHumInt = hInt;
+    blitBg(0, ROW_HUM_Y, PET_X, 20);
+    drawDroplet(ROW_LABEL_X + 2, ROW_HUM_Y + 4, TFT_GREEN);
+    drawRowBar(ROW_HUM_Y, hInt >= 0 ? hInt / 100.0f : -1, TFT_GREEN);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString(hInt >= 0 ? String(hInt) + "%" : "--", ROW_VAL_X, ROW_HUM_Y, 2);
+  }
+
+  // --- DeepSeek single line: dot in the glyph column, "DPS" (16px) + "CNY"
+  // (small suffix) left-aligned to the BAR column (34), balance LEFT-aligned
+  // to the shared numbers column (ROW_VAL_X = 96), same 16px font.
+  String dsVal = dsEverLoaded ? String(dsBalance, 2) : "--";
+  uint16_t dotColor = !dsEverLoaded ? 0x4208 : (dsAvailable ? TFT_GREEN : TFT_RED);
+  static String lastDsLabel = "\x01", lastDsVal = "\x01";
+  static uint16_t lastDotColor = 0xFFFF;
+  String dsLabel = "DPS " + String(dsCurrency);
+  if (force || dsLabel != lastDsLabel || dsVal != lastDsVal || dotColor != lastDotColor) {
+    lastDsLabel = dsLabel;
+    lastDsVal = dsVal;
+    lastDotColor = dotColor;
+    blitBg(0, DS_Y - 2, PET_X, 20);
+    tft.fillCircle(14, DS_Y + 8, 4, dotColor);
+    tft.setTextDatum(TL_DATUM);
+    if (bgActive) tft.setTextColor(0x9DF3); else tft.setTextColor(0x9DF3, TFT_BLACK);
+    tft.drawString("DPS", ROW_BAR_X, DS_Y, 2);
+    tft.drawString(dsCurrency, ROW_BAR_X + tft.textWidth("DPS", 2) + 5, DS_Y + 8, 1);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString(dsVal, ROW_VAL_X, DS_Y, 2);
+  }
+
+  // --- corner pet: the app currently "on duty", scaled into the big
+  // bottom-right box. loop() advances clockPetFrame at the pet-page cadence.
+  static int petDrawnApp = -1;
+  if (force || petDrawnApp != (int)currentApp) {
+    petDrawnApp = (int)currentApp;
+    clockPetFrame = 0;
+    drawClockPet(currentApp, clockPetFrame);
+  }
+}
+
+void clockTick() {
+  clockColonOn = !clockColonOn; // 1Hz blink; minute rollover caught by text compare
+  drawClockScreen(false);
+}
+
 // ---------- WiFi / bridge polling ----------
 
 WiFiManager wifiManager; // global: the config portal now runs non-blocking in loop()
@@ -1303,6 +1974,8 @@ bool parseStatusJson(const String &payload) {
     codexStatus.needsInput = x["needs_input"] | false;
   }
   statusMusicPlaying = doc["music_playing"] | false;
+  long epoch = doc["epoch"] | 0L; // bridge wall clock (wired mode has no SNTP)
+  if (epoch > 0) setClockFromEpoch(epoch);
   return true;
 }
 
@@ -1314,6 +1987,15 @@ DisplayMode effectiveMode() {
     if (claudeStatus.needsInput || codexStatus.needsInput) return MODE_AUTO;
     // music page needs HTTP for cover/text bitmaps, so don't auto-promote
     // when running wired-only (no WiFi)
+    if (statusMusicPlaying && WiFi.status() == WL_CONNECTED) return MODE_MUSIC;
+  }
+  // MODE_CLOCK with active work: auto-promote to pet page so the user sees
+  // Claude/Codex working status. Falls back to clock when idle.
+  if (displayMode == MODE_CLOCK) {
+    bool claudeWorking = claudeStatus.status == "working";
+    bool codexWorking = codexStatus.status == "working";
+    if (claudeWorking || codexWorking || claudeStatus.needsInput || codexStatus.needsInput)
+      return MODE_AUTO; // pet page: show the working agent
     if (statusMusicPlaying && WiFi.status() == WL_CONNECTED) return MODE_MUSIC;
   }
   return displayMode;
@@ -1353,7 +2035,7 @@ void pollBridge() {
   }
   http.end();
   DisplayMode eff = effectiveMode();
-  if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
+  if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK && eff != MODE_CLOCK) {
     // Only a real app switch clears the screen; a plain data refresh paints
     // in place so the poll doesn't flash the whole display.
     if (updateActiveApp()) drawActiveApp();
@@ -1375,6 +2057,154 @@ char serialLine[1600]; // biggest frame is #STATUS at ~600 bytes
 size_t serialLineLen = 0;
 
 bool wiredActive() { return wiredEverLinked && (millis() - lastSerialFrameMs) < 15000UL; }
+
+// ----- wired bulk push: wallpaper + CJK strips + music art over serial -----
+// Frames: "#BG <rev> <b64len>", "#STRIP <id> <rev> <b64len>" (0=city 1=hi/lo
+// 2=date), "#COVER <rev> <b64len>" or "#MTEXT <rev> <b64len>" header, then
+// "#C <base64>" chunk lines (each a multiple of 4 chars), then "#E". Big
+// payloads stream into LittleFS staging files and replace the target only
+// after the full transfer lands; small strips land in a RAM buffer and are
+// blitted when complete. This gives wired-only devices (no WiFi at all) the
+// full clock + music pages.
+File bgRxFile;
+int fileRxType = 0; // 0=none 1=wallpaper 2=music cover 3=music text strip
+int bgRxRev = -1;
+size_t bgRxBytes = 0;
+const char *CLOCKBG_TMP = "/bg.tmp"; // staged until the full transfer lands
+int stripRxId = -1; // 0=name 1=hilo 2=date
+int stripRxRev = -1;
+uint8_t stripRxBuf[DATE_STRIP_W * DATE_STRIP_H * 2]; // largest strip
+size_t stripRxBytes = 0;
+
+// Begins a file-target bulk transfer (wallpaper / cover / music text).
+void startFileRx(int type, const char *tmpPath, int rev) {
+  if (fileRxType) bgRxFile.close();
+  stripRxId = -1; // one transfer at a time
+  bgRxFile = LittleFS.open(tmpPath, "w");
+  fileRxType = bgRxFile ? type : 0;
+  bgRxRev = rev;
+  bgRxBytes = 0;
+}
+
+int b64Val(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+// Decodes one chunk (length a multiple of 4, '=' padding only at the very
+// end of the stream) into out; returns the decoded byte count.
+size_t b64Decode(const char *in, size_t n, uint8_t *out) {
+  size_t o = 0;
+  for (size_t i = 0; i + 4 <= n; i += 4) {
+    int v0 = b64Val(in[i]), v1 = b64Val(in[i + 1]);
+    int v2 = in[i + 2] == '=' ? -1 : b64Val(in[i + 2]);
+    int v3 = in[i + 3] == '=' ? -1 : b64Val(in[i + 3]);
+    if (v0 < 0 || v1 < 0) break;
+    uint32_t t = ((uint32_t)v0 << 18) | ((uint32_t)v1 << 12) |
+                 ((uint32_t)(v2 < 0 ? 0 : v2) << 6) | (uint32_t)(v3 < 0 ? 0 : v3);
+    out[o++] = (t >> 16) & 0xFF;
+    if (v2 >= 0) out[o++] = (t >> 8) & 0xFF;
+    if (v3 >= 0) out[o++] = t & 0xFF;
+  }
+  return o;
+}
+
+void handleBulkChunk(char *b64) {
+  size_t n = strlen(b64);
+  uint8_t dec[724];
+  size_t dn = b64Decode(b64, n, dec);
+  if (fileRxType) {
+    bgRxFile.write(dec, dn);
+    bgRxBytes += dn;
+  } else if (stripRxId >= 0) {
+    if (stripRxBytes + dn <= sizeof(stripRxBuf)) {
+      memcpy(stripRxBuf + stripRxBytes, dec, dn);
+      stripRxBytes += dn;
+    }
+  }
+}
+
+// Blits a LittleFS-held RGB565 image (cover art / music text strip); false
+// when the file is missing or truncated, so the caller can fall back.
+bool blitMusicFile(const char *path, int x, int y, int w, int h) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  if ((size_t)f.size() != (size_t)w * h * 2) {
+    f.close();
+    return false;
+  }
+  for (int r = 0; r < h; r++) {
+    f.read((uint8_t *)rowBuf, (size_t)w * 2);
+    tft.pushImage(x, y + r, w, 1, rowBuf);
+  }
+  f.close();
+  return true;
+}
+
+void drawMusicScreenWired(); // defined next to drawMusicScreen
+
+void handleBulkEnd() {
+  if (fileRxType) {
+    int type = fileRxType;
+    fileRxType = 0;
+    bgRxFile.close();
+    const char *tmp = type == 1 ? CLOCKBG_TMP : type == 2 ? COVER_TMP : MTEXT_TMP;
+    const char *final = type == 1 ? CLOCKBG_FILE : type == 2 ? COVER_FILE : MTEXT_FILE;
+    size_t expect = type == 1 ? CLOCKBG_BYTES : type == 2 ? MUSIC_COVER_BYTES : MUSIC_TEXT_BYTES;
+    if (bgRxBytes == expect) {
+      LittleFS.remove(final);
+      LittleFS.rename(tmp, final);
+      if (type == 1) {
+        bgDrawnRev = bgRxRev;
+        wallpaperReady = true;
+        saveWallpaperCfg();
+        clockChromeDrawn = false; // full repaint over the new background
+        Serial.printf("[wallpaper] serial push ok rev=%d\n", bgRxRev);
+      } else if (type == 2) {
+        coverFileRev = bgRxRev;
+        musicCoverDirty = true;
+        Serial.printf("[music] cover push ok rev=%d\n", bgRxRev);
+        if (effectiveMode() == MODE_MUSIC) drawMusicScreenWired();
+      } else {
+        mtextFileRev = bgRxRev;
+        musicTextDirty = true;
+        Serial.printf("[music] text push ok rev=%d\n", bgRxRev);
+        if (effectiveMode() == MODE_MUSIC) drawMusicScreenWired();
+      }
+    } else {
+      LittleFS.remove(tmp); // old file (if any) survives a bad push
+      Serial.printf("[bulk] serial push BAD type=%d size %u\n", type, (unsigned)bgRxBytes);
+    }
+    return;
+  }
+  if (stripRxId < 0) return;
+  int id = stripRxId;
+  stripRxId = -1;
+  int w = id == 2 ? DATE_STRIP_W : WEATHER_NAME_W;
+  int h = id == 2 ? DATE_STRIP_H : WEATHER_NAME_H;
+  int x = id == 0 ? CITY_STRIP_X : id == 1 ? HILO_STRIP_X : DATE_STRIP_X;
+  int y = id == 0 ? CITY_STRIP_Y : id == 1 ? HILO_STRIP_Y : DATE_STRIP_Y;
+  if (stripRxBytes != (size_t)w * h * 2) {
+    Serial.printf("[strip] serial push BAD id=%d size %u\n", id, (unsigned)stripRxBytes);
+    return;
+  }
+  if (id == 0) weatherNameDrawnRev = stripRxRev;
+  else if (id == 1) weatherHiloDrawnRev = stripRxRev;
+  else dateDrawnRev = stripRxRev;
+  // Draw now only when the clock page is up without the wallpaper (with the
+  // wallpaper on, these lines are baked into it; the drawn-rev bump above
+  // still stops the HTTP fallback from re-fetching).
+  if (effectiveMode() == MODE_CLOCK && !(wallpaperOn && wallpaperReady)) {
+    for (int r = 0; r < h; r++) {
+      memcpy(rowBuf, stripRxBuf + (size_t)r * w * 2, (size_t)w * 2);
+      tft.pushImage(x, y + r, w, 1, rowBuf);
+    }
+  }
+}
 
 // First data over either transport replaces the boot/portal screen.
 void showMainUiIfNeeded() {
@@ -1398,7 +2228,7 @@ void handleSerialFrame(char *line) {
       everPolled = true;
       showMainUiIfNeeded();
       DisplayMode eff = effectiveMode();
-      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
+      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK && eff != MODE_CLOCK) {
         if (updateActiveApp()) drawActiveApp();
         else refreshActiveApp();
       }
@@ -1411,6 +2241,71 @@ void handleSerialFrame(char *line) {
   }
   if (!strncmp(line, "#STOCK ", 7)) {
     handleStockPayload(String(line + 7));
+    return;
+  }
+  if (!strncmp(line, "#WEATHER ", 9)) {
+    // Wired mode owns the data path: weather arrives over serial instead of
+    // HTTP. The CJK strips + wallpaper follow as #STRIP/#BG bulk pushes.
+    if (handleWeatherPayload(String(line + 9))) {
+      Serial.printf("[weather] serial ok=%d temp=%.1f code=%d hum=%d\n", weatherEverLoaded,
+                    weatherTempC, weatherCode, weatherHumidity);
+    }
+    return;
+  }
+  if (!strncmp(line, "#BG ", 4)) {
+    int rev;
+    long len;
+    if (sscanf(line + 4, "%d %ld", &rev, &len) == 2 && len > 0)
+      startFileRx(1, CLOCKBG_TMP, rev);
+    return;
+  }
+  if (!strncmp(line, "#COVER ", 7)) {
+    int rev;
+    long len;
+    if (sscanf(line + 7, "%d %ld", &rev, &len) == 2 && len > 0)
+      startFileRx(2, COVER_TMP, rev);
+    return;
+  }
+  if (!strncmp(line, "#MTEXT ", 7)) {
+    int rev;
+    long len;
+    if (sscanf(line + 7, "%d %ld", &rev, &len) == 2 && len > 0)
+      startFileRx(3, MTEXT_TMP, rev);
+    return;
+  }
+  if (!strncmp(line, "#STRIP ", 7)) {
+    int id, rev;
+    long len;
+    if (sscanf(line + 7, "%d %d %ld", &id, &rev, &len) == 3 && id >= 0 && id <= 2 && len > 0 &&
+        !fileRxType) {
+      stripRxId = id;
+      stripRxRev = rev;
+      stripRxBytes = 0;
+    }
+    return;
+  }
+  if (!strncmp(line, "#MUSIC ", 7)) {
+    bool cc = false, tc = false;
+    if (applyMusicJson(String(line + 7), &cc, &tc)) {
+      musicCoverDirty |= cc;
+      musicTextDirty |= tc;
+      if (effectiveMode() == MODE_MUSIC) drawMusicScreenWired();
+    }
+    return;
+  }
+  if (!strncmp(line, "#C ", 3)) {
+    handleBulkChunk(line + 3);
+    return;
+  }
+  if (!strcmp(line, "#E")) {
+    handleBulkEnd();
+    return;
+  }
+  if (!strncmp(line, "#DEEPSEEK ", 10)) {
+    if (handleDeepSeekPayload(String(line + 10))) {
+      Serial.printf("[deepseek] serial ok=%d bal=%.2f %s avail=%d\n", dsEverLoaded, dsBalance,
+                    dsCurrency, dsAvailable);
+    }
     return;
   }
   if (!strncmp(line, "#CMD ", 5)) {
@@ -1430,6 +2325,7 @@ void handleSerialFrame(char *line) {
       else if (m == "net") displayMode = MODE_NET;
       else if (m == "music") displayMode = MODE_MUSIC;
       else if (m == "stock") displayMode = MODE_STOCK;
+      else if (m == "clock") displayMode = MODE_CLOCK;
       // the effectiveMode transition handler in loop() repaints the chrome
     }
     return;
@@ -1499,6 +2395,25 @@ void handleRoot() {
   html += "<div style='font-size:13px;color:#555'>当前：<span id='briv'>" + String(brightness) +
           "%</span>（0 = 熄屏，设置立即生效并记住）</div>";
 
+  // Quick display-mode switch: pet page (auto) vs the new clock page. Uses the
+  // same /api/display endpoint the Mac/Windows tray apps call.
+  html += "<h2 style='font-size:16px;margin-top:28px'>屏幕显示</h2>";
+  html += "<button onclick=\"fetch('/api/display',{method:'POST',headers:{'Content-Type':"
+          "'application/x-www-form-urlencoded'},body:'mode=auto'})\">桌宠页（自动）</button> ";
+  html += "<button onclick=\"fetch('/api/display',{method:'POST',headers:{'Content-Type':"
+          "'application/x-www-form-urlencoded'},body:'mode=clock'})\" "
+          "style='background:#059669'>时钟页</button>";
+
+  // Desktop-wallpaper background for the clock page (Mac bridge renders it).
+  html += "<h2 style='font-size:16px;margin-top:28px'>桌面壁纸背景</h2>";
+  html += "<p style='font-size:13px;color:#555'>时钟页用 Mac 当前桌面壁纸做背景（自动变暗保证文字清晰，"
+          "壁纸更换会自动同步）。需要 Mac 桥接程序在线（WiFi 或 USB 串口均可）。</p>";
+  html += "<button onclick=\"fetch('/api/wallpaper',{method:'POST',headers:{'Content-Type':"
+          "'application/x-www-form-urlencoded'},body:'on=" + String(wallpaperOn ? 0 : 1) +
+          "'}).then(()=>location.reload())\" style='background:" +
+          String(wallpaperOn ? "#6b7280" : "#059669") + "'>" +
+          String(wallpaperOn ? "关闭壁纸背景" : "开启壁纸背景") + "</button>";
+
   // On-device GIF upload: replaces a character's animation without reflashing.
   html += "<h2 style='font-size:16px;margin-top:28px'>桌宠动画（上传 GIF）</h2>";
   html += "<p style='font-size:13px;color:#555'>上传一个 .gif，设备会在板上解码并缩放到对应角色的尺寸，"
@@ -1553,6 +2468,7 @@ const char *displayModeName(DisplayMode m) {
   if (m == MODE_NET) return "net";
   if (m == MODE_MUSIC) return "music";
   if (m == MODE_STOCK) return "stock";
+  if (m == MODE_CLOCK) return "clock";
   return "auto";
 }
 
@@ -1570,6 +2486,20 @@ void handleApiInfo() {
   doc["brightness"] = brightness;
   doc["wired"] = wiredActive(); // true = data currently arrives over USB serial
   doc["fw"] = FW_VERSION;
+  doc["wallpaper"] = wallpaperOn && wallpaperReady;
+  doc["bg_drawn"] = bgDrawnRev; // rev actually stored in /bg.bin (== weather.bg_rev when in sync)
+  JsonObject wth = doc["weather"].to<JsonObject>();
+  wth["ok"] = weatherEverLoaded;
+  wth["temp"] = weatherTempC;
+  wth["code"] = weatherCode;
+  wth["humidity"] = weatherHumidity;
+  wth["name_rev"] = weatherNameRev;
+  wth["bg_rev"] = bgRev;
+  JsonObject dsj = doc["deepseek"].to<JsonObject>();
+  dsj["ok"] = dsEverLoaded;
+  dsj["avail"] = dsAvailable;
+  dsj["bal"] = dsBalance;
+  dsj["cur"] = dsCurrency;
   JsonObject c = doc["claude"].to<JsonObject>();
   c["status"] = claudeStatus.status;
   c["custom_sprite"] = claudeCustom;
@@ -1593,8 +2523,9 @@ void handleApiDisplay() {
   else if (mode == "net") displayMode = MODE_NET;
   else if (mode == "music") displayMode = MODE_MUSIC;
   else if (mode == "stock") displayMode = MODE_STOCK;
+  else if (mode == "clock") displayMode = MODE_CLOCK;
   else {
-    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock");
+    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock|clock");
     return;
   }
   Serial.printf("[api] display mode = %s\n", mode.c_str());
@@ -1607,6 +2538,10 @@ void handleApiDisplay() {
   } else if (displayMode == MODE_STOCK) {
     stockChromeDrawn = false;
     lastStockPollMs = 0; // poll + draw on the next loop tick
+  } else if (displayMode == MODE_CLOCK) {
+    clockChromeDrawn = false;
+    lastClockTickMs = 0; // draw on the next loop tick
+    lastWeatherPollMs = 0;
   } else {
     updateActiveApp();
     drawActiveApp(); // unconditional: also repaints over a previous net chart
@@ -1627,6 +2562,19 @@ void handleApiBrightness() {
   applyBrightness();
   saveBrightness();
   Serial.printf("[api] brightness = %d\n", brightness);
+  webServer.send(200, "text/plain", "ok");
+}
+
+void handleApiWallpaper() {
+  String onArg = webServer.arg("on");
+  if (onArg.length() == 0) {
+    webServer.send(400, "text/plain", "missing on (0/1)");
+    return;
+  }
+  wallpaperOn = onArg.toInt() != 0;
+  saveWallpaperCfg();
+  clockChromeDrawn = false; // force a full clock repaint with/without the background
+  Serial.printf("[api] wallpaper = %d\n", wallpaperOn);
   webServer.send(200, "text/plain", "ok");
 }
 
@@ -1919,6 +2867,7 @@ void handleSpriteUploadDone(ActiveApp slot) {
   }
 }
 
+
 void setupWebServer() {
   webServer.on("/", HTTP_GET, handleRoot);
   webServer.on("/save", HTTP_POST, handleSave);
@@ -1927,6 +2876,7 @@ void setupWebServer() {
   webServer.on("/api/display", HTTP_POST, handleApiDisplay);
   webServer.on("/api/bridge", HTTP_POST, handleApiBridge);
   webServer.on("/api/brightness", HTTP_POST, handleApiBrightness);
+  webServer.on("/api/wallpaper", HTTP_POST, handleApiWallpaper);
   webServer.on("/sprite/claude/reset", HTTP_POST, []() { handleSpriteReset(APP_CLAUDE); });
   webServer.on("/sprite/codex/reset", HTTP_POST, []() { handleSpriteReset(APP_CODEX); });
   webServer.on("/sprite/claude/raw", HTTP_GET, []() { handleSpriteRaw(APP_CLAUDE); });
@@ -1937,6 +2887,7 @@ void setupWebServer() {
   webServer.on(
       "/sprite/codex", HTTP_POST, []() { handleSpriteUploadDone(APP_CODEX); },
       []() { handleSpriteUploadChunk(CODEX_GIF_FILE); });
+
   webServer.begin();
   Serial.printf("[web] admin server listening on http://%s/\n", WiFi.localIP().toString().c_str());
 }
@@ -1951,6 +2902,10 @@ void setup() {
   loadBrightness();
   loadCustomSpriteState();
 
+  loadWallpaperCfg();
+  setenv("TZ", CLOCK_TZ, 1); // wired-only mode has no SNTP: localtime() still needs the zone
+  tzset();
+
   tft.init();
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
@@ -1963,6 +2918,7 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     setupWebServer();
     webServerStarted = true;
+    setupNtp();
 
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(TL_DATUM);
@@ -1989,6 +2945,7 @@ void loop() {
     // port 80 by now, so the admin server can bind it
     setupWebServer();
     webServerStarted = true;
+    setupNtp();
     showMainUiIfNeeded();
     lastPollMs = 0; // poll the bridge right away
   }
@@ -2012,6 +2969,10 @@ void loop() {
     } else if (eff == MODE_STOCK) {
       stockChromeDrawn = false;
       lastStockPollMs = 0;
+    } else if (eff == MODE_CLOCK) {
+      clockChromeDrawn = false;
+      lastClockTickMs = 0;
+      lastWeatherPollMs = 0; // fetch weather right away on entering the page
     } else {
       updateActiveApp();
       drawActiveApp();
@@ -2031,9 +2992,10 @@ void loop() {
     }
   } else if (eff == MODE_MUSIC) {
     // music now-playing mode: cover art + track metadata from the bridge
+    // (wired: #MUSIC frames drive redraws, art lands as #COVER/#MTEXT pushes)
     if (nowMs - lastMusicPollMs >= MUSIC_POLL_INTERVAL_MS) {
       lastMusicPollMs = nowMs;
-      pollMusic();
+      if (!wiredActive()) pollMusic();
     }
   } else if (eff == MODE_STOCK) {
     // stock watchlist: HTTP poll unless the serial link is pushing #STOCK
@@ -2042,6 +3004,26 @@ void loop() {
       if (!wiredActive()) pollStock();
     }
     if (!stockChromeDrawn || stockDirty) drawStockScreen();
+  } else if (eff == MODE_CLOCK) {
+    // wall clock page: SNTP keeps time locally, weather comes from the bridge
+    if (nowMs - lastClockTickMs >= CLOCK_TICK_MS) {
+      lastClockTickMs = nowMs;
+      clockTick();
+    }
+    if (nowMs - lastWeatherPollMs >= WEATHER_POLL_INTERVAL_MS) {
+      lastWeatherPollMs = nowMs;
+      if (!wiredActive()) { // wired mode: data arrives via #WEATHER/#DEEPSEEK frames
+        pollWeather();
+        pollDeepSeek();
+      }
+    }
+    // corner pet: free-running walk cycle, same cadence as the pet page
+    if (nowMs - lastClockPetMs >= ANIM_INTERVAL_MS) {
+      lastClockPetMs = nowMs;
+      int frames = (currentApp == APP_CLAUDE) ? claudeFrameCount() : codexFrameCount();
+      clockPetFrame = (clockPetFrame + 1) % frames;
+      drawClockPet(currentApp, clockPetFrame);
+    }
   } else {
     // sprite walk-cycle animation (only advances while that app is showing)
     if (nowMs - lastAnimMs >= ANIM_INTERVAL_MS) {
