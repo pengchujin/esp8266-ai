@@ -97,15 +97,23 @@ static class Program
             _ => _ = DeviceClient.HealPairingIfNeeded(Port), null,
             TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
 
-        try
+        void ApplyNetworkBinding()
         {
-            server.Start();
-            Console.Error.WriteLine($"[bridge] serving /status on 0.0.0.0:{Port}");
+            netMonitor.ResetForNetworkChange();
+            var address = NetworkBinding.LocalIPv4Address();
+            try
+            {
+                server.Rebind(address);
+                var lan = address == null ? "LAN unavailable" : $"{address}:{Port}";
+                Console.Error.WriteLine($"[bridge] serving loopback and {lan}");
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine($"[bridge] failed to apply network binding: {e.Message}");
+            }
         }
-        catch (Exception e)
-        {
-            Console.Error.WriteLine($"[bridge] failed to bind port {Port}: {e.Message}");
-        }
+        NetworkBinding.Changed += ApplyNetworkBinding;
+        ApplyNetworkBinding();
 
         var context = new TrayAppContext(service, usage, netMonitor, nowPlaying, stockMonitor, Port);
         usage.StartAutoRefresh();

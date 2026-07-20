@@ -1,6 +1,5 @@
 using System.Net;
 using System.Net.Http.Headers;
-using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text.Json;
 
@@ -40,7 +39,7 @@ static class DeviceClient
     // per-request CancellationTokenSources carry the timeouts (5s info, 8s
     // posts, 30s sprite pull, 60s GIF upload+on-device decode), so the client
     // itself must not impose a shorter global one
-    static readonly HttpClient Http = new() { Timeout = Timeout.InfiniteTimeSpan };
+    static readonly HttpClient Http = CreateHttpClient();
 
     public static string Host
     {
@@ -70,6 +69,35 @@ static class DeviceClient
     {
         var b = BaseUrl ?? throw new DeviceException("未设置设备地址，请先在菜单里填写设备 IP");
         return new Uri(b, path);
+    }
+
+    static HttpClient CreateHttpClient()
+    {
+        var handler = new SocketsHttpHandler
+        {
+            // Device requests are sparse. Avoid retaining a pooled connection
+            // after the user switches adapters.
+            PooledConnectionLifetime = TimeSpan.Zero,
+            ConnectCallback = async (context, cancellationToken) =>
+            {
+                var localAddress = NetworkBinding.LocalIPv4Address()
+                    ?? throw new InvalidOperationException(NetworkBinding.UnavailableMessage);
+                var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream,
+                                        ProtocolType.Tcp);
+                try
+                {
+                    socket.Bind(new IPEndPoint(localAddress, 0));
+                    await socket.ConnectAsync(context.DnsEndPoint, cancellationToken);
+                    return new NetworkStream(socket, ownsSocket: true);
+                }
+                catch
+                {
+                    socket.Dispose();
+                    throw;
+                }
+            },
+        };
+        return new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
     }
 
     /// GET /api/info
@@ -263,23 +291,21 @@ static class DeviceClient
         return await ScanSubnet(progress);
     }
 
-    /// Parallel sweep of the local /24 (254 hosts, ~0.8s timeout each,
-    /// 32-wide). Only used when the passive route came up empty.
+    /// Parallel sweep of the selected adapter's subnet (capped to its local
+    /// /24 slice, ~0.8s timeout each, 32-wide). Only used when the passive
+    /// route came up empty.
     static async Task<string> ScanSubnet(Action<string> progress)
     {
         var myIp = LocalIPv4();
-        var dot = myIp?.LastIndexOf('.') ?? -1;
-        if (myIp == null || dot < 0) return null;
-        var prefix = myIp[..dot];
-        progress($"扫描 {prefix}.1-254…");
+        var addresses = NetworkBinding.ScanAddresses();
+        if (myIp == null || addresses.Count == 0) return null;
+        progress($"通过 {myIp} 扫描 {addresses.First()}-{addresses.Last()}…");
 
         using var sem = new SemaphoreSlim(32);
         string found = null;
         var tasks = new List<Task>();
-        for (int n = 1; n <= 254; n++)
+        foreach (var ip in addresses)
         {
-            var ip = $"{prefix}.{n}";
-            if (ip == myIp) continue;
             tasks.Add(Task.Run(async () =>
             {
                 await sem.WaitAsync();
@@ -344,34 +370,8 @@ static class DeviceClient
         }
     }
 
-    /// LAN IPv4 of this PC — used for one-click "point the device's bridge at
-    /// this machine". Prefers an interface that has a default gateway.
+    /// IPv4 of the selected adapter — used for one-click "point the device's
+    /// bridge at this machine". Automatic mode prefers a default gateway.
     public static string LocalIPv4()
-    {
-        string best = null;
-        try
-        {
-            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
-            {
-                if (nic.OperationalStatus != OperationalStatus.Up) continue;
-                if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
-                var props = nic.GetIPProperties();
-                var hasGateway = props.GatewayAddresses
-                    .Any(g => g.Address?.AddressFamily == AddressFamily.InterNetwork);
-                foreach (var addr in props.UnicastAddresses)
-                {
-                    if (addr.Address.AddressFamily != AddressFamily.InterNetwork) continue;
-                    if (IPAddress.IsLoopback(addr.Address)) continue;
-                    var ip = addr.Address.ToString();
-                    if (hasGateway) return ip;
-                    best ??= ip;
-                }
-            }
-        }
-        catch
-        {
-            // fall through
-        }
-        return best;
-    }
+        => NetworkBinding.LocalIPv4Address()?.ToString();
 }

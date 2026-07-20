@@ -19,6 +19,7 @@ sealed class TrayAppContext : ApplicationContext
     readonly ToolStripMenuItem _claudeUsageItem = new("Claude …") { Enabled = false };
     readonly ToolStripMenuItem _codexUsageItem = new("Codex …") { Enabled = false };
     readonly ToolStripMenuItem _deviceInfoItem = new("设备：未设置") { Enabled = false };
+    readonly ToolStripMenuItem _networkMenu = new("绑定网卡");
     readonly Dictionary<string, ToolStripMenuItem> _modeItems = new();
 
     public TrayAppContext(StatusService service, UsageFetcher usage, NetSpeedMonitor netMonitor,
@@ -43,6 +44,7 @@ sealed class TrayAppContext : ApplicationContext
         };
         _menu.Opening += (_, _) =>
         {
+            RefreshNetworkMenu();
             _usage.Refresh();
             RefreshUsageLines();
             _ = RefreshDeviceSection();
@@ -70,6 +72,8 @@ sealed class TrayAppContext : ApplicationContext
         _menu.Items.Add(_codexUsageItem);
         _menu.Items.Add(new ToolStripSeparator());
 
+        _networkMenu.DropDownOpening += (_, _) => RefreshNetworkMenu();
+        _menu.Items.Add(_networkMenu);
         _menu.Items.Add(_deviceInfoItem);
         _menu.Items.Add(MakeItem("自动查找并配对设备", async (_, _) => await AutoPairAction()));
         _menu.Items.Add(MakeItem("设置设备地址…", (_, _) => SetDeviceAddress()));
@@ -130,6 +134,60 @@ sealed class TrayAppContext : ApplicationContext
             _trayIcon.Visible = false;
             Application.Exit();
         }));
+    }
+
+    void RefreshNetworkMenu()
+    {
+        _networkMenu.DropDownItems.Clear();
+        var selectedId = NetworkBinding.SelectedInterfaceId;
+        var effective = NetworkBinding.EffectiveAdapter();
+        _networkMenu.Text = effective == null
+            ? "绑定网卡：不可用"
+            : $"绑定网卡：{effective.Name} · {effective.Address}";
+
+        var automatic = new ToolStripMenuItem(effective == null || selectedId.Length > 0
+            ? "自动选择"
+            : $"自动选择（当前：{effective.Name} · {effective.Address}）")
+        {
+            Checked = selectedId.Length == 0,
+        };
+        automatic.Click += (_, _) => SelectNetworkAdapter("");
+        _networkMenu.DropDownItems.Add(automatic);
+        _networkMenu.DropDownItems.Add(new ToolStripSeparator());
+
+        var adapters = NetworkBinding.AvailableAdapters();
+        foreach (var adapter in adapters)
+        {
+            var item = new ToolStripMenuItem($"{adapter.Name} · {adapter.Address}")
+            {
+                Checked = string.Equals(selectedId, adapter.Id,
+                                        StringComparison.OrdinalIgnoreCase),
+                ToolTipText = adapter.Description,
+            };
+            item.Click += (_, _) => SelectNetworkAdapter(adapter.Id);
+            _networkMenu.DropDownItems.Add(item);
+        }
+
+        if (selectedId.Length > 0 && !adapters.Any(a => string.Equals(
+            a.Id, selectedId, StringComparison.OrdinalIgnoreCase)))
+        {
+            _networkMenu.DropDownItems.Add(new ToolStripMenuItem(
+                "已选择的网卡当前不可用") { Checked = true, Enabled = false });
+        }
+    }
+
+    void SelectNetworkAdapter(string interfaceId)
+    {
+        NetworkBinding.SelectedInterfaceId = interfaceId;
+        RefreshNetworkMenu();
+        var adapter = NetworkBinding.EffectiveAdapter();
+        if (adapter == null)
+        {
+            Toast("网卡不可用", NetworkBinding.UnavailableMessage);
+            return;
+        }
+        Toast("已切换绑定网卡",
+              $"设备搜索、桥接地址、设备请求和网速统计将使用：\n{adapter.Name} · {adapter.Address}");
     }
 
     static ToolStripMenuItem MakeItem(string title, EventHandler onClick)
