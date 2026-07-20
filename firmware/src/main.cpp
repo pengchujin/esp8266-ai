@@ -76,7 +76,7 @@ unsigned long lastSwitchMs = 0;
 // auto = follow working status, claude/codex = pin that app on screen,
 // net/music = show Mac-side telemetry pages instead of the pet.
 enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC, MODE_STOCK, MODE_CLOCK };
-DisplayMode displayMode = MODE_AUTO;
+DisplayMode displayMode = MODE_CLOCK; // default: weather clock page
 
 // When AUTO and the Mac reports audio playing, the screen auto-switches to the
 // music page and back when it stops — same spirit as the Claude/Codex auto
@@ -1987,6 +1987,15 @@ DisplayMode effectiveMode() {
     if (claudeStatus.needsInput || codexStatus.needsInput) return MODE_AUTO;
     // music page needs HTTP for cover/text bitmaps, so don't auto-promote
     // when running wired-only (no WiFi)
+    if (statusMusicPlaying && WiFi.status() == WL_CONNECTED) return MODE_MUSIC;
+  }
+  // MODE_CLOCK with active work: auto-promote to pet page so the user sees
+  // Claude/Codex working status. Falls back to clock when idle.
+  if (displayMode == MODE_CLOCK) {
+    bool claudeWorking = claudeStatus.status == "working";
+    bool codexWorking = codexStatus.status == "working";
+    if (claudeWorking || codexWorking || claudeStatus.needsInput || codexStatus.needsInput)
+      return MODE_AUTO; // pet page: show the working agent
     if (statusMusicPlaying && WiFi.status() == WL_CONNECTED) return MODE_MUSIC;
   }
   return displayMode;
