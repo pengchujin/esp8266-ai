@@ -40,6 +40,46 @@ final class SerialLink {
 
     var isLinked: Bool { linked }
 
+    /// Push a #CMD frame (display mode, brightness) to the clock. Without this,
+    /// a wired-only device - no WiFi, so no HTTP API - can be watched but not
+    /// controlled: every menu command would go out over a network it isn't on.
+    /// Returns false when the frame did not go out whole, so callers fall back
+    /// to HTTP instead of reporting a success that never reached the device.
+    @discardableResult
+    func sendCommand(_ obj: [String: Any]) -> Bool {
+        guard linked, fd >= 0,
+              let json = try? JSONSerialization.data(withJSONObject: obj) else { return false }
+        return sendWhole(frame("#CMD ", json))
+    }
+
+    /// send() is fire-and-forget: one non-blocking write, partial writes and
+    /// EAGAIN ignored. Fine for #STATUS/#NET, which are re-pushed seconds later.
+    /// Not fine for a command: it is sent once, and half a frame corrupts the
+    /// next one too, because the device splits its input on newlines. So loop
+    /// until the frame is out, and report honestly if it isn't.
+    private func sendWhole(_ data: Data, timeout: TimeInterval = 0.5) -> Bool {
+        guard fd >= 0 else { return false }
+        let deadline = Date().addingTimeInterval(timeout)
+        var sent = 0
+        while sent < data.count {
+            let n = data.withUnsafeBytes { buf -> Int in
+                write(fd, buf.baseAddress!.advanced(by: sent), data.count - sent)
+            }
+            if n > 0 {
+                sent += n
+                continue
+            }
+            if n < 0 && (errno == EAGAIN || errno == EINTR) {
+                guard Date() < deadline else { return false } // TX buffer stayed full
+                usleep(2000)
+                continue
+            }
+            closePort() // unplugged or dead fd
+            return false
+        }
+        return true
+    }
+
     private func tick() {
         if fd < 0 {
             scanAndOpen()

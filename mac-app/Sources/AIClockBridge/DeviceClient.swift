@@ -82,7 +82,17 @@ final class DeviceClient {
     }
 
     /// POST /api/display  mode=auto|claude|codex|net|music
+    /// Installed by main.swift when the serial link is up. Commands go down the
+    /// wire whenever a device is linked there: it's instant, and it's the only
+    /// route that reaches a clock running wired-only (no WiFi, so no HTTP API).
+    /// Returns false when nothing is linked, and we fall back to HTTP.
+    static var sendWiredCommand: (([String: Any]) -> Bool)?
+
     static func setDisplayMode(_ mode: String, completion: @escaping (Error?) -> Void) {
+        if sendWiredCommand?(["display": mode]) == true {
+            completion(nil)
+            return
+        }
         postForm(path: "api/display", fields: ["mode": mode], completion: completion)
     }
 
@@ -93,6 +103,10 @@ final class DeviceClient {
 
     /// POST /api/brightness  level=0-100 (0 = backlight off); device persists it
     static func setBrightness(_ level: Int, completion: @escaping (Error?) -> Void) {
+        if sendWiredCommand?(["brightness": level]) == true {
+            completion(nil)
+            return
+        }
         postForm(path: "api/brightness", fields: ["level": String(level)], completion: completion)
     }
 
