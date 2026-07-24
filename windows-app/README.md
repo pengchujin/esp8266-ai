@@ -10,15 +10,16 @@
 - **右键托盘图标** → 控制菜单：Claude/Codex 完整额度（5h/周 + 重置倒计时）、
   自动查找并配对设备、设置设备地址、屏幕显示模式、petdex 桌宠画廊、恢复默认动画、
   把本机设为设备桥接、桥接服务地址
-- 本地 HTTP 服务 `0.0.0.0:8765`：`/status`、`/net`、`/music`、`/music/cover.raw`、
+- 可在托盘菜单选择绑定网卡；设备搜索、桥接 IP、设备请求和网速统计统一使用所选网卡
+- 本地 HTTP 服务监听所选网卡与 `127.0.0.1:8765`：`/status`、`/net`、`/music`、`/music/cover.raw`、
   `/music/text.raw`、`POST /event`（Claude Code / Codex hooks 秒级状态推送）
 - 数据来源同 Mac 版：`%USERPROFILE%\.claude\projects` / `%USERPROFILE%\.codex\sessions`
   的 JSONL 日志 + 各自官方用量接口（凭据读
   `%USERPROFILE%\.claude\.credentials.json` 和 `%USERPROFILE%\.codex\auth.json`，
   token 只发给各自官方 API）
 - 音乐页读系统级 Now Playing（WinRT `GlobalSystemMediaTransportControlsSessionManager`，
-  Spotify / 浏览器 / 本地播放器都能识别）；网速取物理网卡（以太网/WiFi）字节计数，
-  4Hz 采样，排除 VPN/虚拟网卡
+  Spotify / 浏览器 / 本地播放器都能识别）；网速取绑定网卡的字节计数并以 4Hz 采样，
+  自动模式优先选择带默认网关的物理网卡，也可显式选择 VPN/虚拟网卡
 
 与 Mac 版的差异：
 
@@ -39,7 +40,7 @@ dotnet publish -c Release -r win-x64 --self-contained false
 # 产物在 bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\AIClockBridge.exe
 ```
 
-首次启动 Windows 会弹防火墙授权（HTTP 服务监听 0.0.0.0:8765，设备要从局域网访问，
+首次启动 Windows 会弹防火墙授权（HTTP 服务监听所选网卡的 8765 端口，设备要从局域网访问，
 选"允许"）。
 
 **开机自启**：`Win+R` → `shell:startup` → 把 `AIClockBridge.exe` 的快捷方式放进去。
@@ -69,5 +70,5 @@ curl.exe -s http://localhost:8765/status | python -m json.tool
 | `NetSpeedMonitor.cs` | `NetSpeedMonitor.swift` | 4Hz 网速采样环 |
 | `NowPlayingMonitor.cs` | `NowPlayingMonitor.swift` | 系统 Now Playing + 封面/文字条 RGB565 |
 | `DeviceClient.cs` | `DeviceClient.swift` | 设备 HTTP API + 自动配对/子网扫描 |
-| `MiniHttpServer.cs` | `HTTPServer.swift` | 0.0.0.0:8765 极简 HTTP 服务 |
+| `MiniHttpServer.cs` | `HTTPServer.swift` | 所选网卡 + 127.0.0.1:8765 极简 HTTP 服务 |
 | `Rgb565.cs` | （MirrorPopover 内联） | RGB565 大端编解码 |

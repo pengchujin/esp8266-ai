@@ -3,7 +3,7 @@ using System.Text.Json;
 namespace AIClockBridge;
 
 // UserDefaults stand-in: a tiny JSON key/value store under %APPDATA%.
-// Holds device_host / device_last_seen, same keys as the Mac app.
+// Holds device addressing plus the stable ID of the selected network adapter.
 static class Settings
 {
     static readonly object Lock = new();

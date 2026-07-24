@@ -5,9 +5,9 @@ namespace AIClockBridge;
 
 // Samples this PC's real up/down throughput 4x per second from the OS
 // per-interface byte counters (NetworkInterface.GetIPStatistics, same source
-// Task Manager uses). Only physical Ethernet/WiFi adapters are summed so
-// VPN/loopback/virtual traffic isn't double counted. Keeps a ring of the last
-// 3 minutes; the mirror chart and the ESP8266 (via GET /net) both read it.
+// Task Manager uses). Only the adapter selected in the tray menu is sampled.
+// Keeps a ring of the last 3 minutes; the mirror chart and the ESP8266 (via
+// GET /net) both read it.
 sealed class NetSpeedMonitor
 {
     public readonly record struct Sample(double Rx, double Tx); // bytes/sec
@@ -31,6 +31,17 @@ sealed class NetSpeedMonitor
         SampleNow();
         _timer = new System.Threading.Timer(_ => SampleNow(), null,
             TimeSpan.FromSeconds(SampleInterval), TimeSpan.FromSeconds(SampleInterval));
+    }
+
+    public void ResetForNetworkChange()
+    {
+        lock (_lock)
+        {
+            _samples.Clear();
+            _lastRx = null;
+            _lastTx = null;
+            _lastAt = null;
+        }
     }
 
     /// Most recent `count` samples, oldest first.
@@ -103,53 +114,50 @@ sealed class NetSpeedMonitor
 
     void SampleNow()
     {
-        var (rx, tx) = Counters();
+        var counters = Counters();
         var now = DateTime.UtcNow;
-        var lr = _lastRx;
-        var lt = _lastTx;
-        var la = _lastAt;
-        _lastRx = rx;
-        _lastTx = tx;
-        _lastAt = now;
-        if (!lr.HasValue || !lt.HasValue || !la.HasValue) return;
-        var dt = (now - la.Value).TotalSeconds;
-        if (dt <= 0.2) return;
-        // counters can reset when an adapter bounces; treat negatives as zero
-        var dRx = Math.Max(0, rx - lr.Value);
-        var dTx = Math.Max(0, tx - lt.Value);
-        var sample = new Sample(dRx / dt, dTx / dt);
         lock (_lock)
         {
+            if (!counters.HasValue)
+            {
+                _lastRx = null;
+                _lastTx = null;
+                _lastAt = null;
+                return;
+            }
+            var (rx, tx) = counters.Value;
+            var lr = _lastRx;
+            var lt = _lastTx;
+            var la = _lastAt;
+            _lastRx = rx;
+            _lastTx = tx;
+            _lastAt = now;
+            if (!lr.HasValue || !lt.HasValue || !la.HasValue) return;
+            var dt = (now - la.Value).TotalSeconds;
+            if (dt <= 0.2) return;
+            // Counters can reset when an adapter bounces; treat negatives as zero.
+            var dRx = Math.Max(0, rx - lr.Value);
+            var dTx = Math.Max(0, tx - lt.Value);
+            var sample = new Sample(dRx / dt, dTx / dt);
             _samples.Add(sample);
             _totalSamples++;
             if (_samples.Count > Capacity) _samples.RemoveRange(0, _samples.Count - Capacity);
         }
     }
 
-    static (long, long) Counters()
+    static (long, long)? Counters()
     {
-        long rx = 0, tx = 0;
         try
         {
-            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
-            {
-                if (nic.OperationalStatus != OperationalStatus.Up) continue;
-                if (nic.NetworkInterfaceType != NetworkInterfaceType.Ethernet
-                    && nic.NetworkInterfaceType != NetworkInterfaceType.Wireless80211) continue;
-                var desc = nic.Description.ToLowerInvariant();
-                // skip common virtual adapters that report as Ethernet
-                if (desc.Contains("virtual") || desc.Contains("vpn") || desc.Contains("tap")
-                    || desc.Contains("hyper-v") || desc.Contains("vmware")
-                    || desc.Contains("loopback") || desc.Contains("wintun")) continue;
-                var stats = nic.GetIPStatistics();
-                rx += stats.BytesReceived;
-                tx += stats.BytesSent;
-            }
+            var adapter = NetworkBinding.EffectiveAdapter();
+            if (adapter == null) return null;
+            var stats = adapter.Interface.GetIPStatistics();
+            return (stats.BytesReceived, stats.BytesSent);
         }
         catch
         {
-            // adapter enumeration can transiently fail; keep last counters
+            // Adapter enumeration can transiently fail; discard the baseline.
+            return null;
         }
-        return (rx, tx);
     }
 }

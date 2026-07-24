@@ -4,17 +4,18 @@ using System.Text;
 
 namespace AIClockBridge;
 
-// Port of the Swift Network.framework server: a tiny HTTP/1.1 listener on
-// 0.0.0.0:<port>. Raw TcpListener instead of HttpListener because binding
-// HttpListener to non-localhost prefixes needs an admin urlacl — a plain
-// socket doesn't (only the usual firewall prompt on first run).
+// Port of the Swift Network.framework server: a tiny HTTP/1.1 listener. It
+// listens on the selected LAN adapter plus loopback, preserving local hook
+// calls without exposing the bridge through every adapter on the machine.
+// Raw TcpListener avoids the admin urlacl required by HttpListener.
 sealed class MiniHttpServer
 {
     readonly int _port;
     readonly Dictionary<string, Func<byte[]>> _routes;
     readonly Dictionary<string, Func<byte[]>> _binaryRoutes;
     readonly Dictionary<string, Func<byte[], byte[]>> _postRoutes;
-    TcpListener _listener;
+    readonly object _listenerLock = new();
+    readonly List<TcpListener> _listeners = new();
 
     /// Called with (path, remoteIP) for every request. The ESP8266 polls
     /// /status constantly, so this is how the app learns the device's LAN
@@ -32,21 +33,49 @@ sealed class MiniHttpServer
         _postRoutes = postRoutes ?? new();
     }
 
-    public void Start()
+    public void Rebind(IPAddress lanAddress)
     {
-        _listener = new TcpListener(IPAddress.Any, _port);
-        _listener.Start();
-        Task.Run(AcceptLoop);
+        lock (_listenerLock)
+        {
+            foreach (var listener in _listeners) listener.Stop();
+            _listeners.Clear();
+
+            Exception loopbackError = null;
+            try { StartListener(IPAddress.Loopback); }
+            catch (Exception e) { loopbackError = e; }
+
+            Exception lanError = null;
+            if (lanAddress != null && !IPAddress.IsLoopback(lanAddress))
+            {
+                try { StartListener(lanAddress); }
+                catch (Exception e) { lanError = e; }
+            }
+
+            if (_listeners.Count == 0)
+                throw new InvalidOperationException(
+                    $"无法监听端口 {_port}: {(lanError ?? loopbackError)?.Message}");
+            if (lanError != null)
+                throw new InvalidOperationException(
+                    $"无法绑定网卡 {lanAddress}:{_port}: {lanError.Message}");
+        }
     }
 
-    async Task AcceptLoop()
+    void StartListener(IPAddress address)
+    {
+        var listener = new TcpListener(address, _port);
+        listener.Start();
+        _listeners.Add(listener);
+        Task.Run(() => AcceptLoop(listener));
+    }
+
+    async Task AcceptLoop(TcpListener listener)
     {
         while (true)
         {
             TcpClient client;
             try
             {
-                client = await _listener.AcceptTcpClientAsync();
+                client = await listener.AcceptTcpClientAsync();
             }
             catch
             {
