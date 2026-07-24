@@ -577,6 +577,29 @@ void drawAppLogo() {
   }
 }
 
+// Days until the weekly window resets, top-right corner inside the ring
+// (mirrors the app logo top-left). Weekly only - the 5h window is too short
+// for a day count to say anything. Under a day it degrades to hours.
+const int RESET_CX = 200, RESET_LABEL_Y = 18, RESET_VALUE_Y = 34;
+String lastResetDays;
+
+String resetDaysText(int min) {
+  if (min < 0) return "";
+  if (min < 1440) return String((min + 59) / 60) + "h";
+  return String((min + 1439) / 1440) + "d";
+}
+
+void drawResetDays(bool force) {
+  String t = resetDaysText(currentWeekResetMin());
+  if (!force && t == lastResetDays) return;
+  lastResetDays = t;
+  tft.fillRect(RESET_CX - 30, RESET_LABEL_Y, 54, RESET_VALUE_Y + 26 - RESET_LABEL_Y, TFT_BLACK);
+  if (t.length() == 0) return;
+  tft.setTextDatum(TC_DATUM);
+  drawBoldString("Reset", RESET_CX, RESET_LABEL_Y, 2, TFT_LIGHTGREY);
+  drawBoldString(t, RESET_CX, RESET_VALUE_Y, 4, TFT_WHITE);
+}
+
 // Codex's ring percentage: the 5h window when it exists, otherwise the
 // weekly one (Codex removed the 5h limit in 2026-07).
 float codexRingPct() {
@@ -614,6 +637,7 @@ void drawActiveApp() {
   }
   if (showingCd != CD_NONE) drawCountdown(true);
   drawAppLogo();
+  drawResetDays(true);
 }
 
 // In-place refresh after a bridge poll: ring repaint + only the text that
@@ -630,6 +654,7 @@ void refreshActiveApp() {
     drawSquareRing(codexRingPct(), currentStatusColor());
     drawQuotaText(codexStatus.primaryPct, codexStatus.weeklyPct, false);
   }
+  drawResetDays(false);
   if (showingCd != CD_NONE) {
     syncCountdownDeadline();
     drawCountdown(false);
