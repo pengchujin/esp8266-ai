@@ -37,6 +37,13 @@ sealed class UsageFetcher
     static readonly TimeSpan MinFetchInterval = TimeSpan.FromSeconds(60);
     static readonly TimeSpan RateLimitBackoff = TimeSpan.FromSeconds(300);
 
+    // Persisted last-good quota, so a cold start that lands inside the Claude
+    // endpoint's 429 window shows the previous percentages instead of a blank
+    // until the first successful fetch (which Merge() then keeps rolling).
+    const string ClaudeCacheKey = "usage_cache_claude";
+    const string CodexCacheKey = "usage_cache_codex";
+    static readonly double CacheMaxAgeSec = 24 * 3600;
+
     public ProviderUsage Claude { get { lock (_lock) return _claude; } }
     public ProviderUsage Codex { get { lock (_lock) return _codex; } }
 
@@ -44,6 +51,14 @@ sealed class UsageFetcher
     public Action OnUpdate;
 
     System.Threading.SynchronizationContext _ui;
+
+    public UsageFetcher()
+    {
+        var c = LoadCache(ClaudeCacheKey);
+        if (c != null) _claude = c;
+        var x = LoadCache(CodexCacheKey);
+        if (x != null) _codex = x;
+    }
 
     public void StartAutoRefresh(int intervalSeconds = 120)
     {
@@ -66,21 +81,66 @@ sealed class UsageFetcher
         {
             var claude = await FetchClaude();
             var codex = await FetchCodex();
+            ProviderUsage mergedClaude, mergedCodex;
             lock (_lock)
             {
                 // Keep the last good numbers when a refresh only produced an
                 // error (network hiccup / 429) - stale quota beats no quota.
                 _claude = Merge(_claude, claude);
                 _codex = Merge(_codex, codex);
+                mergedClaude = _claude;
+                mergedCodex = _codex;
                 _fetching = false;
                 var backoff = claude.RateLimited ? RateLimitBackoff : MinFetchInterval;
                 _nextAllowedFetch = DateTime.UtcNow + backoff;
             }
+            SaveCache(mergedClaude, ClaudeCacheKey);
+            SaveCache(mergedCodex, CodexCacheKey);
             if (claude.Error != null) Console.Error.WriteLine($"[usage] claude: {claude.Error}");
             if (codex.Error != null) Console.Error.WriteLine($"[usage] codex: {codex.Error}");
             if (_ui != null) _ui.Post(_ => OnUpdate?.Invoke(), null);
             else OnUpdate?.Invoke();
         });
+    }
+
+    // MARK: - last-good cache (Settings store under %APPDATA%)
+
+    /// Persist absolute reset instants (not minute countdowns), so a value
+    /// reloaded later still resolves to a correct remaining time.
+    static void SaveCache(ProviderUsage u, string key)
+    {
+        if (u.PrimaryPct == null && u.WeeklyPct == null) return;
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var dict = new Dictionary<string, double> { ["at"] = now };
+        if (u.PrimaryPct.HasValue) dict["pPct"] = u.PrimaryPct.Value;
+        if (u.PrimaryResetMin.HasValue) dict["pResetAt"] = now + u.PrimaryResetMin.Value * 60.0;
+        if (u.WeeklyPct.HasValue) dict["wPct"] = u.WeeklyPct.Value;
+        if (u.WeeklyResetMin.HasValue) dict["wResetAt"] = now + u.WeeklyResetMin.Value * 60.0;
+        try { Settings.Set(key, JsonSerializer.Serialize(dict)); }
+        catch { /* best effort */ }
+    }
+
+    static ProviderUsage LoadCache(string key)
+    {
+        var raw = Settings.Get(key);
+        if (string.IsNullOrEmpty(raw)) return null;
+        try
+        {
+            var dict = JsonSerializer.Deserialize<Dictionary<string, double>>(raw);
+            if (dict == null) return null;
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var at = dict.TryGetValue("at", out var a) ? a : 0;
+            if (now - at >= CacheMaxAgeSec) return null;   // drop stale cache
+            var u = new ProviderUsage();
+            if (dict.TryGetValue("pPct", out var pp)) u.PrimaryPct = pp;
+            if (dict.TryGetValue("wPct", out var wp)) u.WeeklyPct = wp;
+            if (u.PrimaryPct == null && u.WeeklyPct == null) return null;
+            if (dict.TryGetValue("pResetAt", out var pr)) u.PrimaryResetMin = Math.Max(0, (int)((pr - now) / 60));
+            if (dict.TryGetValue("wResetAt", out var wr)) u.WeeklyResetMin = Math.Max(0, (int)((wr - now) / 60));
+            u.FetchedAt = DateTimeOffset.FromUnixTimeSeconds((long)at).UtcDateTime;
+            return u;
+        }
+        catch { return null; }
     }
 
     static ProviderUsage Merge(ProviderUsage old, ProviderUsage fresh)

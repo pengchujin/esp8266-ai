@@ -31,11 +31,23 @@ final class UsageFetcher {
     private let minFetchInterval: TimeInterval = 60
     private let rateLimitBackoff: TimeInterval = 300
 
+    // Persisted last-good quota, so a cold start that lands inside the Claude
+    // endpoint's 429 window shows the previous percentages instead of a blank
+    // until the first successful fetch (which merge() then keeps rolling).
+    private static let claudeCacheKey = "usage_cache_claude"
+    private static let codexCacheKey = "usage_cache_codex"
+    private static let cacheMaxAge: TimeInterval = 24 * 3600
+
     var claude: ProviderUsage { lock.lock(); defer { lock.unlock() }; return _claude }
     var codex: ProviderUsage { lock.lock(); defer { lock.unlock() }; return _codex }
 
     /// Called on the main thread after either provider updates.
     var onUpdate: (() -> Void)?
+
+    init() {
+        if let c = Self.loadCache(key: Self.claudeCacheKey) { _claude = c }
+        if let c = Self.loadCache(key: Self.codexCacheKey) { _codex = c }
+    }
 
     func startAutoRefresh(interval: TimeInterval = 120) {
         refresh()
@@ -60,14 +72,51 @@ final class UsageFetcher {
             // error (network hiccup / 429) - stale quota beats no quota.
             self._claude = Self.merge(old: self._claude, new: claude)
             self._codex = Self.merge(old: self._codex, new: codex)
+            let mergedClaude = self._claude
+            let mergedCodex = self._codex
             self.fetching = false
             let backoff: TimeInterval = claude.rateLimited ? self.rateLimitBackoff : self.minFetchInterval
             self.nextAllowedFetch = Date().addingTimeInterval(backoff)
             self.lock.unlock()
+            Self.saveCache(mergedClaude, key: Self.claudeCacheKey)
+            Self.saveCache(mergedCodex, key: Self.codexCacheKey)
             if let e = claude.error { FileHandle.standardError.write(Data("[usage] claude: \(e)\n".utf8)) }
             if let e = codex.error { FileHandle.standardError.write(Data("[usage] codex: \(e)\n".utf8)) }
             DispatchQueue.main.async { self.onUpdate?() }
         }
+    }
+
+    // MARK: - last-good cache (UserDefaults, local.AIClockBridge domain)
+
+    /// Persist absolute reset instants (not minute countdowns), so a value
+    /// reloaded later still resolves to a correct remaining time.
+    private static func saveCache(_ u: ProviderUsage, key: String) {
+        guard u.primaryPct != nil || u.weeklyPct != nil else { return }
+        let now = Date().timeIntervalSince1970
+        var dict: [String: Any] = ["at": now]
+        if let p = u.primaryPct { dict["pPct"] = p }
+        if let r = u.primaryResetMin { dict["pResetAt"] = now + Double(r) * 60 }
+        if let w = u.weeklyPct { dict["wPct"] = w }
+        if let r = u.weeklyResetMin { dict["wResetAt"] = now + Double(r) * 60 }
+        if let data = try? JSONSerialization.data(withJSONObject: dict) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
+    private static func loadCache(key: String) -> ProviderUsage? {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let now = Date().timeIntervalSince1970
+        let at = (dict["at"] as? NSNumber)?.doubleValue ?? 0
+        guard now - at < cacheMaxAge else { return nil }   // drop stale cache
+        var u = ProviderUsage()
+        u.primaryPct = (dict["pPct"] as? NSNumber)?.doubleValue
+        u.weeklyPct = (dict["wPct"] as? NSNumber)?.doubleValue
+        guard u.primaryPct != nil || u.weeklyPct != nil else { return nil }
+        if let r = (dict["pResetAt"] as? NSNumber)?.doubleValue { u.primaryResetMin = max(0, Int((r - now) / 60)) }
+        if let r = (dict["wResetAt"] as? NSNumber)?.doubleValue { u.weeklyResetMin = max(0, Int((r - now) / 60)) }
+        u.fetchedAt = Date(timeIntervalSince1970: at)
+        return u
     }
 
     private static func merge(old: ProviderUsage, new: ProviderUsage) -> ProviderUsage {
