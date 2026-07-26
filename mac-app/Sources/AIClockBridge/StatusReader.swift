@@ -43,6 +43,14 @@ final class StatusService {
     private let claudeDir = ("~/.claude/projects" as NSString).expandingTildeInPath
     private let codexDir = ("~/.codex/sessions" as NSString).expandingTildeInPath
 
+    // Fast-path byte needles: only lines containing these get JSON-parsed.
+    private static let claudeUsageNeedle = Data("\"usage\":{".utf8)
+    private static let codexTokenNeedle = Data("\"token_count\"".utf8)
+
+    // Per-file parse cache (keyed by path): unchanged append-only logs are not
+    // re-read every scan. Mutated only under `lock` via readClaude/snapshot.
+    private var claudeCache: [String: (mtime: TimeInterval, tokens: Int, epochs: [Double])] = [:]
+
     /// Real OAuth quota (5h/weekly windows) merged into snapshots when set;
     /// log-derived values remain the fallback for offline use.
     var usage: UsageFetcher?
@@ -217,9 +225,15 @@ final class StatusService {
     }
 
     /// Lossy UTF-8 read (matches Python's errors="ignore") split into lines.
-    private func readLines(_ url: URL) -> [Substring]? {
+    // Byte-level line split: session logs get large, and decoding the whole
+    // file to a Swift String just to run the Unicode-correct String.contains on
+    // every line was pathologically slow (multi-second scans, pegged a core).
+    // Splitting the raw bytes and filtering with Data.range(of:) stays on UTF-8
+    // and is orders of magnitude faster.
+    private func readLineData(_ url: URL) -> [Data]? {
         guard let data = try? Data(contentsOf: url) else { return nil }
-        return String(decoding: data, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: true)
+        let newline: UInt8 = 0x0A
+        return data.split(separator: newline, omittingEmptySubsequences: true).map { Data($0) }
     }
 
     private func intVal(_ any: Any?) -> Int {
@@ -234,6 +248,7 @@ final class StatusService {
         var tokensToday = 0
         var lastMtime: TimeInterval = 0
         var firstActiveInWindow: Double? = nil
+        var livePaths = Set<String>()
 
         let fm = FileManager.default
         let root = URL(fileURLWithPath: claudeDir)
@@ -243,28 +258,51 @@ final class StatusService {
                     .contentModificationDate?.timeIntervalSince1970 else { continue }
                 if mtime > lastMtime { lastMtime = mtime }
                 if mtime < todayStart { continue } // no activity today, skip parsing
-                guard let lines = readLines(url) else { continue }
-                for line in lines {
-                    if !line.contains("\"usage\":{") { continue }
-                    guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                          let message = obj["message"] as? [String: Any],
-                          let usage = message["usage"] as? [String: Any] else { continue }
-                    let entryEpoch = parseISO(obj["timestamp"] as? String)
-                    if let e = entryEpoch, e < todayStart { continue }
-                    tokensToday += intVal(usage["input_tokens"]) + intVal(usage["output_tokens"])
-                        + intVal(usage["cache_creation_input_tokens"]) + intVal(usage["cache_read_input_tokens"])
-                    if let e = entryEpoch, now - e < 5 * 3600 {
-                        if firstActiveInWindow == nil || e < firstActiveInWindow! { firstActiveInWindow = e }
-                    }
+                let path = url.path
+                livePaths.insert(path)
+                // Only re-read+parse a file when its mtime changed; otherwise the
+                // logs are append-only static history and we reuse cached totals.
+                let parsed: (tokens: Int, epochs: [Double])
+                if let c = claudeCache[path], c.mtime == mtime {
+                    parsed = (c.tokens, c.epochs)
+                } else {
+                    parsed = parseClaudeFile(url, todayStart: todayStart)
+                    claudeCache[path] = (mtime, parsed.tokens, parsed.epochs)
+                }
+                tokensToday += parsed.tokens
+                for e in parsed.epochs where now - e < 5 * 3600 {
+                    if firstActiveInWindow == nil || e < firstActiveInWindow! { firstActiveInWindow = e }
                 }
             }
         }
+        // Drop entries for files that rolled out of "today" so the cache doesn't grow forever.
+        if claudeCache.count != livePaths.count { claudeCache = claudeCache.filter { livePaths.contains($0.key) } }
 
         var s = ClaudeStatus()
         s.tokensToday = tokensToday
         if let first = firstActiveInWindow { s.sessionMin = Int((now - first) / 60) }
         s.status = statusFromDelta(lastMtime > 0 ? now - lastMtime : 1e9)
         return s
+    }
+
+    /// Parse one Claude jsonl: today's token total + every today entry's epoch
+    /// (epochs feed the rolling 5h session window). Only called on new/changed files.
+    private func parseClaudeFile(_ url: URL, todayStart: Double) -> (tokens: Int, epochs: [Double]) {
+        guard let lines = readLineData(url) else { return (0, []) }
+        var tokens = 0
+        var epochs: [Double] = []
+        for line in lines {
+            if line.range(of: Self.claudeUsageNeedle) == nil { continue }
+            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  let message = obj["message"] as? [String: Any],
+                  let usage = message["usage"] as? [String: Any] else { continue }
+            let entryEpoch = parseISO(obj["timestamp"] as? String)
+            if let e = entryEpoch, e < todayStart { continue }
+            tokens += intVal(usage["input_tokens"]) + intVal(usage["output_tokens"])
+                + intVal(usage["cache_creation_input_tokens"]) + intVal(usage["cache_read_input_tokens"])
+            if let e = entryEpoch { epochs.append(e) }
+        }
+        return (tokens, epochs)
     }
 
     // MARK: - Codex
@@ -299,11 +337,11 @@ final class StatusService {
 
         if let names = try? fm.contentsOfDirectory(at: dayDir, includingPropertiesForKeys: nil) {
             for url in names where url.pathExtension == "jsonl" {
-                guard let lines = readLines(url) else { continue }
+                guard let lines = readLineData(url) else { continue }
                 var sessionMaxTokens = 0
                 for line in lines {
-                    if !line.contains("\"token_count\"") { continue }
-                    guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                    if line.range(of: Self.codexTokenNeedle) == nil { continue }
+                    guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                           let payload = obj["payload"] as? [String: Any],
                           payload["type"] as? String == "token_count" else { continue }
                     let info = payload["info"] as? [String: Any]
