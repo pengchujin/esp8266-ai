@@ -10,7 +10,7 @@
 - **右键托盘图标** → 控制菜单：Claude/Codex 完整额度（5h/周 + 重置倒计时）、
   自动查找并配对设备、设置设备地址、屏幕显示模式、petdex 桌宠画廊、恢复默认动画、
   把本机设为设备桥接、桥接服务地址
-- 本地 HTTP 服务 `0.0.0.0:8765`：`/status`、`/net`、`/music`、`/music/cover.raw`、
+- 本地 HTTP 服务 `0.0.0.0:8765`（端口可改，见下）：`/status`、`/net`、`/music`、`/music/cover.raw`、
   `/music/text.raw`、`POST /event`（Claude Code / Codex hooks 秒级状态推送）
 - 数据来源同 Mac 版：`%USERPROFILE%\.claude\projects` / `%USERPROFILE%\.codex\sessions`
   的 JSONL 日志 + 各自官方用量接口（凭据读
@@ -43,6 +43,23 @@ dotnet publish -c Release -r win-x64 --self-contained false
 选"允许"）。
 
 **开机自启**：`Win+R` → `shell:startup` → 把 `AIClockBridge.exe` 的快捷方式放进去。
+
+### 换服务端口
+
+默认 8765。这个端口有可能被别的软件占着——最常见的是**百度输入法**
+（`baidupinyin.exe` 监听 `0.0.0.0:8765`，输入法里改不了，杀掉进程后
+BaiduPinyinCore 服务还会把它拉起来）。端口被占时程序会弹窗提示，此时换一个端口即可：
+
+- 托盘右键 →「服务端口…」→ 填 8766（留空恢复默认），按提示重启程序
+- 或环境变量：`set AICLOCK_PORT=8766` 后再启动
+- 或启动参数：`AIClockBridge.exe --port 8766`（快捷方式里加也行）
+
+优先级：`--port` > `AICLOCK_PORT` > 托盘里存的设置 > 8765。启动日志会打印实际监听的
+端口（`[bridge] serving /status on 0.0.0.0:8766`）。
+
+改完端口记得让设备也知道：重启后点一次托盘「把本机设为设备桥接」，或在设备网页里把
+Bridge host 改成 `<本机IP>:8766`（固件本来就是按 `host:port` 存的，不用重新刷）。
+Hooks 里的 `http://127.0.0.1:8765/event` 也要跟着改成新端口。
 
 **Hooks 实时状态**（可选，同主 README §7）：Claude Code / Codex 的 hooks 往
 `http://127.0.0.1:8765/event` POST 事件即可，Windows 下 curl 自带。

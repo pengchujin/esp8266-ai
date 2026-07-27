@@ -18,6 +18,13 @@ final class HTTPServer {
     /// the device's LAN address without any scanning.
     var onRequest: ((String, String) -> Void)?
 
+    /// Called once (on the server queue) if the listener never comes up —
+    /// in practice always "port already taken by someone else". NWListener
+    /// reports that asynchronously, so `start()` returning is not proof we
+    /// are actually listening.
+    var onFailure: ((String) -> Void)?
+    private var reportedFailure = false
+
     init(port: UInt16, routes: [String: () -> Data], binaryRoutes: [String: () -> Data] = [:],
          postRoutes: [String: (Data) -> Data] = [:]) {
         self.port = NWEndpoint.Port(rawValue: port)!
@@ -31,6 +38,25 @@ final class HTTPServer {
         params.allowLocalEndpointReuse = true
         let listener = try NWListener(using: params, on: port)
         listener.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
+        // .failed is fatal; .waiting is "retrying", but a busy port parks us
+        // there forever, so both mean the same thing to the user.
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            let reason: String?
+            switch state {
+            case .failed(let error):
+                reason = "\(error)"
+            case .waiting(let error):
+                // Only the busy-port flavour: other waits (no network path yet)
+                // do resolve themselves and must not pop an alert.
+                if case .posix(.EADDRINUSE) = error { reason = "\(error)" } else { reason = nil }
+            default:
+                reason = nil
+            }
+            guard let reason = reason, !self.reportedFailure else { return }
+            self.reportedFailure = true
+            self.onFailure?(reason)
+        }
         listener.start(queue: queue)
         self.listener = listener
     }

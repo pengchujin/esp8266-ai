@@ -112,6 +112,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(makeItem("刷新", #selector(refreshAction), key: "r"))
         menu.addItem(makeItem("桥接服务地址", #selector(showAddress)))
+        menu.addItem(makeItem("服务端口…", #selector(setBridgePort)))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
@@ -311,6 +312,34 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     @objc private func showAddress() {
         let ip = DeviceClient.localIPv4() ?? "<本机局域网IP>"
         Self.toast("桥接服务地址", "http://\(ip):\(port)/status\n\n设备端 Bridge host 填：\(ip):\(port)")
+    }
+
+    @objc private func setBridgePort() {
+        let alert = NSAlert()
+        alert.messageText = "服务端口"
+        alert.informativeText = """
+            设备来拉状态的本机端口，默认 \(BridgePort.fallback)。被别的软件占住时换一个（1-65535），留空恢复默认。
+            退出并重新打开本 app 生效，然后再点一次「把本机设为设备桥接」。
+            """
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        input.stringValue = BridgePort.saved ?? ""
+        input.placeholderString = String(BridgePort.fallback)
+        alert.accessoryView = input
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let text = input.stringValue.trimmingCharacters(in: .whitespaces)
+        if text.isEmpty {
+            BridgePort.saved = nil
+            Self.toast("已恢复默认", "端口改回 \(BridgePort.fallback)，退出并重新打开本 app 生效。")
+        } else if let newPort = BridgePort.parse(text) {
+            BridgePort.saved = String(newPort)
+            Self.toast("已保存", "端口改为 \(newPort)，退出并重新打开本 app 生效。\n"
+                + "设备端 Bridge host 记得跟着改成 <本机IP>:\(newPort)（或重开后点「把本机设为设备桥接」）。")
+        } else {
+            Self.toast("端口无效", "请填 1-65535 之间的数字。")
+        }
     }
 
     private static func toast(_ title: String, _ text: String) {

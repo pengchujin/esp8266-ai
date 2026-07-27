@@ -124,6 +124,7 @@ sealed class TrayAppContext : ApplicationContext
             _ = RefreshDeviceSection();
         }));
         _menu.Items.Add(MakeItem("桥接服务地址", (_, _) => ShowAddress()));
+        _menu.Items.Add(MakeItem("服务端口…", (_, _) => SetBridgePort()));
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(MakeItem("退出", (_, _) =>
         {
@@ -317,6 +318,41 @@ sealed class TrayAppContext : ApplicationContext
         var ip = DeviceClient.LocalIPv4() ?? "<本机局域网IP>";
         Toast("桥接服务地址",
               $"http://{ip}:{_port}/status\n\n设备端 Bridge host 填：{ip}:{_port}");
+    }
+
+    void SetBridgePort()
+    {
+        var input = InputDialog.Show(
+            "服务端口",
+            $"设备来拉状态的本机端口，默认 {BridgePort.Fallback}。被别的软件占住时换一个\n"
+            + "（1-65535），留空恢复默认。改完要重启本程序才生效。",
+            BridgePort.Saved, BridgePort.Fallback.ToString());
+        if (input == null) return;
+        var text = input.Trim();
+        if (text.Length == 0)
+        {
+            BridgePort.Saved = "";
+            AskRestart($"端口改回默认 {BridgePort.Fallback}。");
+            return;
+        }
+        var port = BridgePort.Parse(text);
+        if (port == null)
+        {
+            Toast("端口无效", "请填 1-65535 之间的数字。");
+            return;
+        }
+        BridgePort.Saved = port.Value.ToString();
+        AskRestart($"端口改为 {port.Value}。重启后记得再点一次「把本机设为设备桥接」，"
+                   + $"或把设备端 Bridge host 改成 <本机IP>:{port.Value}。");
+    }
+
+    void AskRestart(string text)
+    {
+        var answer = MessageBox.Show($"{text}\n\n现在重启本程序生效？", "已保存",
+                                     MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+        if (answer != DialogResult.Yes) return;
+        _trayIcon.Visible = false;
+        Application.Restart();
     }
 
     static void Toast(string title, string text)

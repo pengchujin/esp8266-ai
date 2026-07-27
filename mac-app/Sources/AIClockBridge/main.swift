@@ -33,7 +33,9 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--test-pet" {
     exit(0)
 }
 
-let port: UInt16 = 8765
+// Default 8765; override with `--port N`, AICLOCK_PORT or the menu-bar item
+// when something else already owns the port (see BridgePort).
+let port: UInt16 = BridgePort.resolve()
 let service = StatusService()
 let usage = UsageFetcher()
 service.usage = usage
@@ -91,6 +93,24 @@ server.onRequest = { path, ip in
 // device stays silent, find it ourselves and hand it our address.
 Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
     DeviceClient.healPairingIfNeeded(port: port)
+}
+
+// Binding is the one failure the user can't see (menu-bar app, no console):
+// without this the device just never gets data. Say so, and say how to fix it.
+server.onFailure = { reason in
+    FileHandle.standardError.write(Data("[bridge] port \(port) unavailable: \(reason)\n".utf8))
+    DispatchQueue.main.async {
+        let alert = NSAlert()
+        alert.messageText = "端口 \(port) 被占用"
+        alert.informativeText = """
+            本机 \(port) 端口已被别的软件占用，设备拉不到数据。
+            请在菜单栏「服务端口…」里换一个端口（比如 8766），重开本 app 后再点一次「把本机设为设备桥接」。
+
+            系统提示：\(reason)
+            """
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
 }
 
 do {
