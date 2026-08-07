@@ -173,7 +173,7 @@ final class StatusService {
     private var cached: Snapshot?
     private var cachedAt: TimeInterval = 0
     private var scanInFlight = false
-    private var pendingSnapshotCompletion: ((Snapshot) -> Void)?
+    private var pendingSnapshotCompletions: [(Snapshot) -> Void] = []
 
     private struct OverlayState {
         let usage: UsageFetcher?
@@ -287,8 +287,10 @@ final class StatusService {
     }
 
     /// Delivers a fresh snapshot without doing disk work on the caller's
-    /// thread. A single waiter is enough because callers poll again after the
-    /// cache is updated.
+    /// thread. Every caller that arrives while a scan is already in flight
+    /// (e.g. two overlapping ticks after a slow device round-trip) queues up
+    /// and is delivered the same result when that scan finishes — none of
+    /// them are dropped.
     func snapshot(completion: @escaping (Snapshot) -> Void) {
         let now = Date().timeIntervalSince1970
         lock.lock()
@@ -301,9 +303,7 @@ final class StatusService {
             return
         }
 
-        if pendingSnapshotCompletion == nil {
-            pendingSnapshotCompletion = completion
-        }
+        pendingSnapshotCompletions.append(completion)
         let startScan = !scanInFlight
         scanInFlight = true
         lock.unlock()
@@ -357,12 +357,14 @@ final class StatusService {
         cached = raw
         cachedAt = finishedAt
         scanInFlight = false
-        let completion = pendingSnapshotCompletion
-        pendingSnapshotCompletion = nil
+        let completions = pendingSnapshotCompletions
+        pendingSnapshotCompletions.removeAll()
         let state = captureOverlayStateLocked()
         lock.unlock()
 
-        completion?(decorate(raw, now: finishedAt, state: state))
+        guard !completions.isEmpty else { return }
+        let result = decorate(raw, now: finishedAt, state: state)
+        for completion in completions { completion(result) }
     }
 
     private func decorate(_ raw: Snapshot, now: TimeInterval,

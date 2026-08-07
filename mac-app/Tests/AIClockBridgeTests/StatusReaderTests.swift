@@ -124,6 +124,90 @@ final class StatusReaderTests: XCTestCase {
         )
     }
 
+    /// Regression test: two callers that arrive while a scan is already in
+    /// flight (e.g. two overlapping 1s ticks after a slow device round-trip)
+    /// must both be delivered a result, not silently dropped.
+    func testConcurrentSnapshotCompletionsAreAllDelivered() {
+        let scanStarted = DispatchSemaphore(value: 0)
+        let releaseScan = DispatchSemaphore(value: 0)
+        let scanCount = LockedInt()
+
+        let service = StatusService(
+            claudeDirectory: URL(fileURLWithPath: "/tmp/aiclock-no-claude"),
+            codexDirectory: URL(fileURLWithPath: "/tmp/aiclock-no-codex"),
+            scanObserver: {
+                _ = scanCount.increment()
+                scanStarted.signal()
+                _ = releaseScan.wait(timeout: .now() + 2)
+            }
+        )
+
+        let first = expectation(description: "first waiter delivered")
+        let second = expectation(description: "second waiter delivered")
+        let third = expectation(description: "third waiter delivered")
+
+        service.snapshot { _ in first.fulfill() }
+        XCTAssertEqual(scanStarted.wait(timeout: .now() + 1), .success)
+
+        service.snapshot { _ in second.fulfill() }
+        service.snapshot { _ in third.fulfill() }
+
+        releaseScan.signal()
+        wait(for: [first, second, third], timeout: 2)
+        XCTAssertEqual(scanCount.value, 1)
+    }
+
+    /// Regression test for the incremental reader's rotation handling: a file
+    /// truncated and rewritten in place (same path, smaller size - how log
+    /// rotation looks on disk) must reset the cursor and re-parse from byte 0
+    /// instead of under-reading or leaving the stale token total in place.
+    func testStatusReaderResetsCursorAndTokensWhenFileIsTruncatedAndReplaced() throws {
+        let root = try makeTemporaryDirectory()
+        let claudeRoot = root.appendingPathComponent("claude")
+        let codexRoot = root.appendingPathComponent("codex")
+        let claudeProject = claudeRoot.appendingPathComponent("project")
+        try FileManager.default.createDirectory(
+            at: claudeProject, withIntermediateDirectories: true
+        )
+
+        let now = Date()
+        let timestamp = ISO8601DateFormatter()
+        timestamp.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let iso = timestamp.string(from: now)
+        let claudeFile = claudeProject.appendingPathComponent("session.jsonl")
+
+        try write(claudeLine(timestamp: iso, input: 500, output: 500), to: claudeFile)
+
+        let service = StatusService(
+            claudeDirectory: claudeRoot, codexDirectory: codexRoot, cacheTTL: 0
+        )
+
+        let firstResult = expectation(description: "first snapshot")
+        var firstSnapshot: Snapshot?
+        service.snapshot { snapshot in
+            firstSnapshot = snapshot
+            firstResult.fulfill()
+        }
+        wait(for: [firstResult], timeout: 2)
+        XCTAssertEqual(firstSnapshot?.claude.tokensToday, 1000)
+
+        // Simulate rotation: same path, truncated to smaller, fresh content.
+        try Data(claudeLine(timestamp: iso, input: 1, output: 2).utf8).write(to: claudeFile)
+        Thread.sleep(forTimeInterval: 0.01)
+
+        let secondResult = expectation(description: "post-rotation snapshot")
+        var secondSnapshot: Snapshot?
+        service.snapshot { snapshot in
+            secondSnapshot = snapshot
+            secondResult.fulfill()
+        }
+        wait(for: [secondResult], timeout: 2)
+
+        // Only the replacement content should count - neither the stale 1000
+        // nor a double-counted 1003.
+        XCTAssertEqual(secondSnapshot?.claude.tokensToday, 3)
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("AIClockStatusReader")
