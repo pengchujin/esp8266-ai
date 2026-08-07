@@ -650,7 +650,15 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.needsDisplay = true
             return
         }
-        let snap = service.snapshot()
+        service.snapshot { [weak self] snap in
+            DispatchQueue.main.async {
+                guard let self = self, self.popover.isShown else { return }
+                self.applyQuotaScene(self.lastInfo ?? info, snapshot: snap)
+            }
+        }
+    }
+
+    private func applyQuotaScene(_ info: DeviceInfo, snapshot snap: Snapshot) {
         mirror.showingClaude = info.showing != "codex"
         if mirror.showingClaude {
             let pct = snap.claude.fiveHourPct
