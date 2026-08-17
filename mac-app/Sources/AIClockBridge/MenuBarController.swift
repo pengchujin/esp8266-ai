@@ -80,7 +80,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
         let displayMenu = NSMenu()
         for (title, mode) in [("自动（谁在干活显示谁）", "auto"), ("固定 Claude", "claude"),
-                              ("固定 Codex", "codex"), ("网速曲线", "net"),
+                              ("固定 Codex", "codex"), ("时钟页", "clock"), ("网速曲线", "net"),
                               ("音乐播放", "music"), ("股票行情", "stock")] {
             let item = NSMenuItem(title: title, action: #selector(setDisplayMode(_:)), keyEquivalent: "")
             item.target = self
@@ -94,6 +94,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         // (屏幕亮度在左键弹出的镜像页底部，做成滑条了)
 
         menu.addItem(makeItem("设置自选股…", #selector(setStockSymbols)))
+        menu.addItem(makeItem("设置天气城市…", #selector(setWeatherCity)))
+        menu.addItem(makeItem("设置 DeepSeek API Key…", #selector(setDeepSeekKey)))
 
         menu.addItem(makeItem("更换桌宠动画…（petdex）", #selector(openPetPicker)))
 
@@ -173,6 +175,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                                info.codexCustomSprite ? "X:自定义" : "X:默认"]
                 let showing = info.mode == "net" ? "网速"
                     : info.mode == "music" ? "音乐"
+                    : info.mode == "clock" ? "时钟"
                     : (info.showing == "claude" ? "Claude" : "Codex")
                 self.deviceInfoItem.title =
                     "设备：\(info.ip) · 正在显示 \(showing) · \(sprites.joined(separator: " "))"
@@ -274,6 +277,55 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if alert.runModal() == .alertFirstButtonReturn {
             StockMonitor.symbols = input.stringValue.split(separator: ",")
                 .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        }
+    }
+
+    @objc private func setWeatherCity() {
+        let alert = NSAlert()
+        alert.messageText = "天气城市"
+        alert.informativeText = "时钟页天气的数据城市，支持中文（Open-Meteo 地理编码）。例如：上海、北京、杭州"
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        input.stringValue = WeatherMonitor.city
+        input.placeholderString = "上海"
+        alert.accessoryView = input
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        WeatherMonitor.setCity(input.stringValue) { ok in
+            if !ok {
+                let err = NSAlert()
+                err.messageText = "城市未找到"
+                err.informativeText = "Open-Meteo 地理编码没有找到这个城市，保留原设置。"
+                NSApp.activate(ignoringOtherApps: true)
+                err.runModal()
+            }
+        }
+    }
+
+    @objc private func setDeepSeekKey() {
+        let alert = NSAlert()
+        alert.messageText = "DeepSeek API Key"
+        alert.informativeText = "在 platform.deepseek.com 创建、以 sk- 开头的官方 Key，粘贴到这里。时钟页底部会显示账户余额；留空保存则关闭该显示。（第三方中转 Key 无法查询官方余额）"
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        input.stringValue = DeepSeekMonitor.apiKey
+        input.placeholderString = "sk-..."
+        alert.accessoryView = input
+        alert.addButton(withTitle: "保存并验证")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        DeepSeekMonitor.setKey(input.stringValue) { ok, detail in
+            let result = NSAlert()
+            if ok {
+                result.messageText = DeepSeekMonitor.apiKey.isEmpty ? "已关闭 DeepSeek 余额显示" : "Key 有效"
+                result.informativeText = DeepSeekMonitor.apiKey.isEmpty ? "" : "当前余额 \(detail)，屏幕会在下一次刷新时显示。"
+            } else {
+                result.messageText = "验证失败"
+                result.informativeText = "\(detail)\nKey 已保存，稍后会自动重试；如需更换请重新打开本菜单。"
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            result.runModal()
         }
     }
 

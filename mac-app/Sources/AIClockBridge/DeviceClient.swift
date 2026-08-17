@@ -14,6 +14,7 @@ struct DeviceInfo {
     var lastUpdateS = -1    // seconds since the device last got /status data, -1 = never
     var spriteRev = 0       // bumped by the device on animation change
     var brightness = 100    // backlight 0-100 (0 = off)
+    var wallpaper = false   // clock page is using the desktop-wallpaper background
     var claudeCustomSprite = false
     var codexCustomSprite = false
     var claudeW = 111, claudeH = 120
@@ -65,6 +66,7 @@ final class DeviceClient {
                 info.lastUpdateS = (obj["last_update_s"] as? NSNumber)?.intValue ?? -1
                 info.spriteRev = (obj["sprite_rev"] as? NSNumber)?.intValue ?? 0
                 info.brightness = (obj["brightness"] as? NSNumber)?.intValue ?? 100
+                info.wallpaper = obj["wallpaper"] as? Bool ?? false
                 let claude = obj["claude"] as? [String: Any]
                 let codex = obj["codex"] as? [String: Any]
                 info.claudeCustomSprite = claude?["custom_sprite"] as? Bool ?? false

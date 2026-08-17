@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Generate firmware/include/img/weather_icons.h: 8 weather icons, 32x32 RGB565.
+
+Icons are drawn programmatically (no image assets needed) onto a pixel grid,
+then emitted as PROGMEM uint16 arrays in the same pre-byte-swapped big-endian
+order as tools/convert_sprites.py, so the firmware's rowBuf/pushImage path can
+blit them exactly like sprite frames.
+
+Usage: python3 tools/gen_weather_icons.py
+"""
+import os
+
+W = H = 32
+
+# palette (RGB888)
+BLACK = (0, 0, 0)
+YELLOW = (255, 214, 10)
+WHITE = (255, 255, 255)
+SHADE = (154, 160, 166)   # cloud shadow
+GREY = (107, 114, 128)
+CYAN = (56, 189, 248)     # rain
+ICE = (224, 242, 254)     # snow
+
+
+def rgb565(c):
+    r, g, b = c
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+
+
+class Grid:
+    def __init__(self):
+        self.px = [[BLACK] * W for _ in range(H)]
+
+    def set(self, x, y, c):
+        if 0 <= x < W and 0 <= y < H:
+            self.px[y][x] = c
+
+    def fill_circle(self, cx, cy, r, c):
+        for y in range(cy - r, cy + r + 1):
+            for x in range(cx - r, cx + r + 1):
+                if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
+                    self.set(x, y, c)
+
+    def fill_rect(self, x0, y0, x1, y1, c):
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                self.set(x, y, c)
+
+    def line(self, x0, y0, x1, y1, c, thick=1):
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+        err = dx + dy
+        x, y = x0, y0
+        while True:
+            for ty in range(thick):
+                for tx in range(thick):
+                    self.set(x + tx, y + ty, c)
+            if x == x1 and y == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x += sx
+            if e2 <= dx:
+                err += dx
+                y += sy
+
+
+def cloud(g, cx, cy, scale=1.0, body=WHITE, shadow=SHADE):
+    """Three-puff cloud with a flat base and a shadow row under it."""
+    s = scale
+    g.fill_circle(round(cx - 6 * s), cy, round(5 * s), body)
+    g.fill_circle(cx, round(cy - 3 * s), round(6 * s), body)
+    g.fill_circle(round(cx + 6 * s), cy, round(5 * s), body)
+    base_top = round(cy - 1 * s)
+    base_bot = round(cy + 4 * s)
+    g.fill_rect(round(cx - 10 * s), base_top, round(cx + 10 * s), base_bot, body)
+    g.fill_rect(round(cx - 10 * s), base_bot + 1, round(cx + 10 * s), base_bot + 1, shadow)
+
+
+def icon_sun():
+    g = Grid()
+    for ang in range(0, 360, 45):
+        import math
+        dx, dy = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+        g.line(round(16 + dx * 10), round(16 + dy * 10),
+               round(16 + dx * 12), round(16 + dy * 12), YELLOW, thick=2)
+    g.fill_circle(16, 16, 7, YELLOW)
+    return g
+
+
+def icon_partly():
+    g = Grid()
+    import math
+    for ang in range(0, 360, 60):
+        dx, dy = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+        g.line(round(10 + dx * 6), round(10 + dy * 6),
+               round(10 + dx * 8), round(10 + dy * 8), YELLOW, thick=1)
+    g.fill_circle(10, 10, 4, YELLOW)
+    cloud(g, 18, 19, scale=0.9)
+    return g
+
+
+def icon_overcast():
+    g = Grid()
+    cloud(g, 16, 14, scale=1.1)
+    return g
+
+
+def icon_fog():
+    g = Grid()
+    cloud(g, 16, 10, scale=0.8)
+    g.fill_rect(6, 20, 26, 21, GREY)
+    g.fill_rect(10, 24, 30, 25, GREY)
+    g.fill_rect(6, 28, 26, 29, GREY)
+    return g
+
+
+def icon_rain():
+    g = Grid()
+    cloud(g, 16, 11, scale=0.95)
+    for x0 in (9, 16, 23):
+        g.line(x0, 22, x0 - 2, 28, CYAN, thick=2)
+    return g
+
+
+def icon_snow():
+    g = Grid()
+    cloud(g, 16, 11, scale=0.95)
+    for cx, cy in ((9, 24), (17, 27), (24, 23), (13, 21), (21, 29)):
+        g.set(cx, cy, ICE)
+        g.set(cx - 1, cy, ICE)
+        g.set(cx + 1, cy, ICE)
+        g.set(cx, cy - 1, ICE)
+        g.set(cx, cy + 1, ICE)
+    return g
+
+
+def icon_thunder():
+    g = Grid()
+    cloud(g, 16, 10, scale=0.9)
+    # lightning bolt
+    g.line(18, 17, 13, 23, YELLOW, thick=2)
+    g.line(13, 23, 17, 23, YELLOW, thick=2)
+    g.line(17, 23, 12, 29, YELLOW, thick=2)
+    g.line(12, 29, 20, 20, YELLOW, thick=1)
+    return g
+
+
+def icon_unknown():
+    g = Grid()
+    cloud(g, 16, 12, scale=0.9, body=SHADE, shadow=GREY)
+    # blocky question mark
+    g.fill_rect(13, 21, 18, 21, GREY)
+    g.fill_rect(13, 21, 13, 23, GREY)
+    g.fill_rect(13, 23, 16, 23, GREY)
+    g.fill_rect(16, 23, 16, 25, GREY)
+    g.fill_rect(15, 27, 16, 28, GREY)
+    return g
+
+
+ICONS = [
+    ("sun", icon_sun),
+    ("partly", icon_partly),
+    ("overcast", icon_overcast),
+    ("fog", icon_fog),
+    ("rain", icon_rain),
+    ("snow", icon_snow),
+    ("thunder", icon_thunder),
+    ("unknown", icon_unknown),
+]
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    out_path = os.path.join(here, "..", "firmware", "include", "img", "weather_icons.h")
+    lines = [
+        "#pragma once",
+        "// GENERATED by tools/gen_weather_icons.py - do not edit by hand.",
+        "// 8 weather icons, 32x32 RGB565, pre-byte-swapped big-endian like the sprites.",
+        "#define WEATHER_ICON_W 32",
+        "#define WEATHER_ICON_H 32",
+        "#define WEATHER_ICON_COUNT 8",
+        "",
+    ]
+    names = []
+    for idx, (name, fn) in enumerate(ICONS):
+        g = fn()
+        sym = f"weather_icon_{name}"
+        names.append(sym)
+        lines.append(f"static const uint16_t {sym}[WEATHER_ICON_W * WEATHER_ICON_H] PROGMEM = {{")
+        for y in range(H):
+            row = []
+            for x in range(W):
+                v = rgb565(g.px[y][x])
+                v = ((v & 0xFF) << 8) | (v >> 8)  # byte-swap like convert_sprites.py
+                row.append(f"0x{v:04X}")
+            lines.append("    " + ",".join(row) + ",")
+        lines.append("};")
+        lines.append("")
+    lines.append("static const uint16_t *const weather_icons[WEATHER_ICON_COUNT] = {")
+    lines.append("    " + ", ".join(names))
+    lines.append("};")
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"wrote {out_path} ({len(ICONS)} icons)")
+
+
+if __name__ == "__main__":
+    main()

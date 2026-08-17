@@ -359,6 +359,8 @@ extension Snapshot {
         let dict: [String: Any] = [
             "ts": ts,
             "music_playing": musicPlaying,
+            // wall clock for the device's clock page (wired mode has no SNTP)
+            "epoch": Int(Date().timeIntervalSince1970),
             "claude": [
                 "status": claude.status,
                 "tokens_today": claude.tokensToday,
