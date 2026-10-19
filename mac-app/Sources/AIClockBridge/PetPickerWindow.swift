@@ -13,12 +13,14 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
     private let targetPopup = NSPopUpButton()
     private let statePopup = NSPopUpButton()
     private let previewView = NSImageView()
+    private let importButton = NSButton(title: "导入 Codex Pet…", target: nil, action: nil)
     private let uploadButton = NSButton(title: "上传到设备", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "")
 
     private var allPets: [PetdexPet] = []
     private var filtered: [PetdexPet] = []
     private var sheetCache: (slug: String, image: CGImage)?
+    private var importedPet: CodexPetPackage?
     private var previewToken = 0
 
     func show() {
@@ -32,7 +34,7 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 620),
                            styleMask: [.titled, .closable, .resizable],
                            backing: .buffered, defer: false)
-        win.title = "更换桌宠动画（petdex.dev）"
+        win.title = "更换桌宠动画"
         win.isReleasedWhenClosed = false
         win.center()
 
@@ -72,6 +74,9 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
         uploadButton.keyEquivalent = "\r"
         uploadButton.isEnabled = false
 
+        importButton.target = self
+        importButton.action = #selector(importCodexPet)
+
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
 
@@ -79,7 +84,7 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
         controls.orientation = .horizontal
         controls.distribution = .fillProportionally
 
-        let stack = NSStackView(views: [searchField, scroll, previewView, controls, statusLabel])
+        let stack = NSStackView(views: [importButton, searchField, scroll, previewView, controls, statusLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -92,6 +97,7 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             searchField.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28),
+            importButton.widthAnchor.constraint(equalToConstant: 150),
             scroll.widthAnchor.constraint(equalTo: searchField.widthAnchor),
             scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 260),
             previewView.widthAnchor.constraint(equalToConstant: 140),
@@ -147,6 +153,8 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        importedPet = nil
+        targetPopup.isEnabled = true
         previewSelectionChanged()
     }
 
@@ -172,6 +180,16 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
     }
 
     @objc private func previewSelectionChanged() {
+        if let importedPet {
+            let state = selectedState
+            if let gif = PetdexService.buildGif(sheet: importedPet.spritesheet, state: state,
+                                                targetW: 120, targetH: 120) {
+                previewView.image = NSImage(data: gif)
+                uploadButton.isEnabled = true
+                statusLabel.stringValue = "\(importedPet.displayName) · \(state.label) → Codex 九状态宠物"
+            }
+            return
+        }
         guard let pet = selectedPet else { return }
         uploadButton.isEnabled = false
         previewToken += 1
@@ -206,6 +224,28 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
     }
 
     @objc private func uploadTapped() {
+        if let importedPet {
+            uploadButton.isEnabled = false
+            statusLabel.stringValue = "正在转换并上传九状态宠物…"
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                do {
+                    let data = try CodexPetPackageService.buildDeviceFile(from: importedPet)
+                    DispatchQueue.main.async {
+                        DeviceClient.uploadCodexPet(data) { error in
+                            self?.uploadButton.isEnabled = true
+                            self?.statusLabel.stringValue = error.map { "上传失败：\($0.localizedDescription)" }
+                                ?? "✅ 已应用 \(importedPet.displayName) 的九种 Codex 动作"
+                        }
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self?.uploadButton.isEnabled = true
+                        self?.statusLabel.stringValue = "转换失败：\(error.localizedDescription)"
+                    }
+                }
+            }
+            return
+        }
         guard let cache = sheetCache, let pet = selectedPet, cache.slug == pet.slug else { return }
         let s = slotSize
         guard let gif = PetdexService.buildGif(sheet: cache.image, state: selectedState,
@@ -220,6 +260,30 @@ final class PetPickerWindowController: NSObject, NSTableViewDataSource, NSTableV
             self.uploadButton.isEnabled = true
             self.statusLabel.stringValue = error.map { "上传失败：\($0.localizedDescription)" }
                 ?? "✅ 已应用：\(pet.displayName) 现在是 \(s.slot == "claude" ? "Claude" : "Codex") 的桌宠"
+        }
+    }
+
+    @objc private func importCodexPet() {
+        let panel = NSOpenPanel()
+        panel.title = "选择 Codex 宠物目录或 pet.json"
+        panel.prompt = "导入"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: ("~/.codex/pets" as NSString).expandingTildeInPath)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let pet = try CodexPetPackageService.load(from: url)
+            importedPet = pet
+            tableView.deselectAll(nil)
+            targetPopup.selectItem(at: 1)
+            targetPopup.isEnabled = false
+            statePopup.selectItem(at: PetdexService.states.firstIndex { $0.id == "running" } ?? 0)
+            previewSelectionChanged()
+        } catch {
+            importedPet = nil
+            uploadButton.isEnabled = false
+            statusLabel.stringValue = "导入失败：\(error.localizedDescription)"
         }
     }
 }

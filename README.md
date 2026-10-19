@@ -30,7 +30,7 @@
 | <img src="docs/images/feature1.jpg" width="360" alt="AI 工作状态"> | **AI 工作状态与额度**<br>桌宠动起来 = AI 正在干活。方形进度环 + 大字显示 5 小时 / 周额度的真实用量；额度用满自动换成重置倒计时，等你审批时整圈边框红闪提醒。 |
 | <img src="docs/images/feature2.jpg" width="360" alt="网速监视"> | **网速实时监视**<br>任务管理器风格的上下行曲线，56 秒滚动窗口，量程自动调整。 |
 | <img src="docs/images/music.jpg" width="360" alt="音乐播放"> | **音乐播放显示**<br>专辑封面、歌名、歌手、进度条实时同步；音乐响起自动切入，停止自动切回。 |
-| <img src="docs/images/feature3.jpg" width="360" alt="桌宠可换"> | **可换桌宠**<br>内置 [petdex.dev](https://petdex.dev) 画廊 3300+ 开源桌宠，也可上传任意 GIF，设备板上直接解码，无需重烧固件。 |
+| <img src="docs/images/feature3.jpg" width="360" alt="桌宠可换"> | **可换桌宠**<br>USB 控制页可导入标准 Codex Pet 九状态宠物包，图片只在本机转换并经 USB 写入；无需 WiFi 或重烧固件。 |
 
 ## 快速上手
 
@@ -67,7 +67,7 @@
 
 - **屏幕边框红色闪烁**：设备连不上桥接程序——确认电脑端程序在运行、和设备在同一 WiFi。
 - **额度一直显示 `-`**：本机没有登录过 Claude Code / Codex CLI，桥接程序读不到凭据。
-- **想换桌宠**：右键托盘图标 → 「更换桌宠动画…」，挑一个点上传就行。
+- **想换 Codex 桌宠**：打开 `http://127.0.0.1:8765/`，在「Codex 九状态宠物」选择包含 `pet.json` 的宠物目录后上传。传输全程走 USB，且不会修改 Codex 桌面端设置。
 
 ## 开发
 

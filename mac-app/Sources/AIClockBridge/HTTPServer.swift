@@ -83,7 +83,9 @@ final class HTTPServer {
 
     private func respond(_ conn: NWConnection, method: String, path: String, requestBody: Data) {
         let clean = path.split(separator: "?").first.map(String.init) ?? path
+        var isLoopback = false
         if case let .hostPort(host, _) = conn.endpoint {
+            isLoopback = host == .ipv4(.loopback) || host == .ipv6(.loopback)
             // "192.168.1.4%en0" -> "192.168.1.4"
             let ip = String(host.debugDescription.split(separator: "%").first ?? "")
             if !ip.isEmpty { onRequest?(clean, ip) }
@@ -91,7 +93,11 @@ final class HTTPServer {
         let body: Data
         let statusLine: String
         let contentType: String
-        if method == "POST", let handler = postRoutes[clean] {
+        if method == "POST", clean == "/event", !isLoopback {
+            body = Data("forbidden".utf8)
+            statusLine = "403 Forbidden"
+            contentType = "text/plain"
+        } else if method == "POST", let handler = postRoutes[clean] {
             body = handler(requestBody)
             statusLine = "200 OK"
             contentType = "application/json"

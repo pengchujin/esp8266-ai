@@ -1,0 +1,68 @@
+{
+  "description": "Send Codex lifecycle state to the local AI Clock bridge.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/hanson/.codex/hooks/codex-aiclock-event.sh UserPromptSubmit", "timeout": 2 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/hanson/.codex/hooks/codex-aiclock-event.sh PreToolUse", "timeout": 2 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/hanson/.codex/hooks/codex-aiclock-event.sh PostToolUse", "timeout": 2 }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/hanson/.codex/hooks/codex-aiclock-event.sh SubagentStart", "timeout": 2 }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/hanson/.codex/hooks/codex-aiclock-event.sh SubagentStop", "timeout": 2 }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/hanson/.codex/hooks/codex-aiclock-event.sh PreCompact", "timeout": 2 }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/hanson/.codex/hooks/codex-aiclock-event.sh PostCompact", "timeout": 2 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/hanson/.codex/hooks/codex-aiclock-event.sh SessionEnd", "timeout": 2 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/Users/hanson/.codex/hooks/codex-aiclock-event.sh Stop", "timeout": 2 }
+        ]
+      }
+    ]
+  }
+}

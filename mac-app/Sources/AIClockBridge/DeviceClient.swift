@@ -13,9 +13,11 @@ struct DeviceInfo {
     var showing = ""
     var lastUpdateS = -1    // seconds since the device last got /status data, -1 = never
     var spriteRev = 0       // bumped by the device on animation change
+    var petDelayMs = 120
     var brightness = 100    // backlight 0-100 (0 = off)
     var claudeCustomSprite = false
     var codexCustomSprite = false
+    var codexCustomPet = false
     var claudeW = 111, claudeH = 120
     var codexW = 120, codexH = 120
 }
@@ -64,11 +66,13 @@ final class DeviceClient {
                 info.showing = obj["showing"] as? String ?? ""
                 info.lastUpdateS = (obj["last_update_s"] as? NSNumber)?.intValue ?? -1
                 info.spriteRev = (obj["sprite_rev"] as? NSNumber)?.intValue ?? 0
+                info.petDelayMs = (obj["pet_delay_ms"] as? NSNumber)?.intValue ?? 120
                 info.brightness = (obj["brightness"] as? NSNumber)?.intValue ?? 100
                 let claude = obj["claude"] as? [String: Any]
                 let codex = obj["codex"] as? [String: Any]
                 info.claudeCustomSprite = claude?["custom_sprite"] as? Bool ?? false
                 info.codexCustomSprite = codex?["custom_sprite"] as? Bool ?? false
+                info.codexCustomPet = codex?["custom_pet"] as? Bool ?? false
                 info.claudeW = (claude?["w"] as? NSNumber)?.intValue ?? 111
                 info.claudeH = (claude?["h"] as? NSNumber)?.intValue ?? 120
                 info.codexW = (codex?["w"] as? NSNumber)?.intValue ?? 120
@@ -113,6 +117,27 @@ final class DeviceClient {
         body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"pet.gif\"\r\n".utf8))
         body.append(Data("Content-Type: image/gif\r\n\r\n".utf8))
         body.append(gif)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        req.httpBody = body
+        run(req, completion: completion)
+    }
+
+    /// POST /pet/codex — uploads a complete nine-state AIPET1 package.
+    static func uploadCodexPet(_ pet: Data, completion: @escaping (Error?) -> Void) {
+        guard let base = baseURL else {
+            completion(Self.noHostError)
+            return
+        }
+        var req = URLRequest(url: base.appendingPathComponent("pet/codex"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 90
+        let boundary = "aiclock-\(UUID().uuidString)"
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        var body = Data()
+        body.append(Data("--\(boundary)\r\n".utf8))
+        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"pet.aipet\"\r\n".utf8))
+        body.append(Data("Content-Type: application/octet-stream\r\n\r\n".utf8))
+        body.append(pet)
         body.append(Data("\r\n--\(boundary)--\r\n".utf8))
         req.httpBody = body
         run(req, completion: completion)

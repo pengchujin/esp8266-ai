@@ -30,7 +30,7 @@ A retro mini-TV with a 240×240 screen that sits on your desk showing **what Cla
 | <img src="docs/images/feature1.jpg" width="360" alt="AI status"> | **AI status & quota**<br>Pet is walking = the AI is working. A square progress ring plus large digits show your real 5-hour / weekly quota usage; when a window is used up the pet becomes a reset countdown, and the border flashes red when the AI is waiting for your approval. |
 | <img src="docs/images/feature2.jpg" width="360" alt="Network monitor"> | **Live network monitor**<br>Task-manager-style upload/download curves, 56-second rolling window, auto-scaling axis. |
 | <img src="docs/images/music.jpg" width="360" alt="Now playing"> | **Now playing**<br>Album art, title, artist and progress bar in real time; switches in automatically when music starts, back when it stops. |
-| <img src="docs/images/feature3.jpg" width="360" alt="Swappable pets"> | **Swappable pets**<br>Built-in [petdex.dev](https://petdex.dev) gallery with 3300+ open-source pets, or upload any GIF — decoded on the board itself, no reflashing needed. |
+| <img src="docs/images/feature3.jpg" width="360" alt="Swappable pets"> | **Swappable pets**<br>Import a standard nine-state Codex Pet package from the local USB control page. Conversion stays on the Mac and transfer needs neither Wi-Fi nor reflashing. |
 
 ## Getting started
 
@@ -67,7 +67,7 @@ Daily use is all on the tray icon: **left-click** opens a live mirror of the dev
 
 - **Screen border flashing red**: the device can't reach the bridge — make sure the app is running and on the same WiFi.
 - **Quota shows `-` forever**: no Claude Code / Codex CLI login on this machine, so the bridge has no credentials to read.
-- **Want a different pet**: right-click the tray icon → "Change pet animation…", pick one and upload.
+- **Want a different Codex pet**: open `http://127.0.0.1:8765/`, choose the folder containing `pet.json` under “Codex nine-state pet”, then upload over USB.
 
 ## Development
 

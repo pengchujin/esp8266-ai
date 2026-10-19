@@ -1,6 +1,9 @@
 firmware/.pio/
 firmware/.pio-venv/
 mac-app/.build/
+.build/
+artifacts/
+pet-runs/
 windows-app/**/bin/
 windows-app/**/obj/
 __pycache__/

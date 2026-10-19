@@ -30,19 +30,25 @@ ESP8266WebServer webServer(80);
 // firmware rebuild. You POST a raw .gif straight to /sprite/claude or
 // /sprite/codex (the device serves its own upload page at "/"); the ESP8266
 // decodes and rescales the GIF *on-device* (AnimatedGIF, line-by-line so it
-// never needs a full-canvas buffer) into the wire format below, which the
-// display path then reads back frame-by-frame:
-//   [1 byte frame count][frame0 bytes][frame1 bytes]...
-// Each frame is exactly CLAUDE_SPRITE_W x H (or CODEX_SPRITE_W x H) RGB565
-// pixels, byte order matching tools/convert_sprites.py's to_rgb565() so the
-// compiled-in defaults and custom uploads share one draw path.
+// never needs a full-canvas buffer) into the compact SP8 format:
+//   ["SP8"][1 byte frame count][RGB332 frame0][RGB332 frame1]...
+// A complete nine-state Codex pet uses AIPET1 instead; both formats are
+// expanded one row at a time to the display's RGB565 wire order.
 const char *CLAUDE_SPRITE_FILE = "/c.bin";
 const char *CODEX_SPRITE_FILE = "/x.bin";
 const char *CLAUDE_GIF_FILE = "/c.gif"; // raw upload, decoded then removed
 const char *CODEX_GIF_FILE = "/x.gif";
+const char *CODEX_PET_FILE = "/codex.pet";
+const char *CODEX_PET_TEMP_FILE = "/codex.tmp";
 const int MAX_CUSTOM_FRAMES = 8;
 const size_t CLAUDE_FRAME_BYTES = (size_t)CLAUDE_SPRITE_W * CLAUDE_SPRITE_H * 2;
 const size_t CODEX_FRAME_BYTES = (size_t)CODEX_SPRITE_W * CODEX_SPRITE_H * 2;
+const size_t CLAUDE_FRAME_BYTES_332 = (size_t)CLAUDE_SPRITE_W * CLAUDE_SPRITE_H;
+const size_t CODEX_FRAME_BYTES_332 = (size_t)CODEX_SPRITE_W * CODEX_SPRITE_H;
+const int CODEX_PET_W = 144, CODEX_PET_H = 144;
+const size_t CODEX_PET_FRAME_BYTES_332 = (size_t)CODEX_PET_W * CODEX_PET_H;
+const size_t AIPET_HEADER_BYTES = 128;
+const size_t CODEX_PET_DEVICE_BYTES = AIPET_HEADER_BYTES + (size_t)57 * CODEX_PET_FRAME_BYTES_332;
 
 // We never hold a whole sprite frame in RAM. Decoding a GIF needs ~24KB of
 // heap for AnimatedGIF's own buffers, which wouldn't fit alongside a static
@@ -50,17 +56,30 @@ const size_t CODEX_FRAME_BYTES = (size_t)CODEX_SPRITE_W * CODEX_SPRITE_H * 2;
 // the display path and the decoder work one screen-row at a time through these
 // two small scratch rows (SCREEN_W is the widest we ever need).
 uint16_t rowBuf[SCREEN_W];     // current row being drawn / decoded
-uint16_t prevRowBuf[SCREEN_W]; // decode only: same row from the previous frame
+uint16_t scaledRowBuf[SCREEN_W]; // one nearest-neighbor-expanded sprite row
+uint8_t sprite8Row[SCREEN_W];
+uint8_t prevSprite8Row[SCREEN_W];
 
 bool claudeCustom = false;
 int claudeCustomFrames = 0;
 bool codexCustom = false;
 int codexCustomFrames = 0;
+bool codexPetCustom = false;
 uint32_t spriteRev = 0; // bumped on upload/reset so the Mac mirror re-fetches
+
+enum PetState { PET_IDLE, PET_RUNNING_RIGHT, PET_RUNNING_LEFT, PET_WAVING, PET_JUMPING,
+                PET_FAILED, PET_WAITING, PET_RUNNING, PET_REVIEW, PET_STATE_COUNT };
+struct PetStateMeta { uint8_t frames; uint16_t delayMs; uint32_t offset; uint32_t length; };
+PetStateMeta codexPetStates[PET_STATE_COUNT];
+PetState codexPetState = PET_IDLE;
+PetState petStateOverride = PET_IDLE;
+unsigned long petStateOverrideDeadlineMs = 0;
 
 const int SCREEN_CX = 120, SCREEN_CY = 120;
 const int RING_MARGIN = 4;      // inset from screen edge
 const int RING_THICKNESS = 10;  // ring bar thickness
+const int SIDEBAR_CX = 44;
+const int PET_CX = 151, PET_W = 150;
 const unsigned long ANIM_INTERVAL_MS = 120;  // sprite frame advance
 const unsigned long FLASH_INTERVAL_MS = 400; // "urgent" flash speed
 const unsigned long SWITCH_BOTH_MS = 2000;   // both apps working: alternate fast
@@ -75,6 +94,26 @@ unsigned long lastSwitchMs = 0;
 // net/music = show Mac-side telemetry pages instead of the pet.
 enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC, MODE_STOCK };
 DisplayMode displayMode = MODE_AUTO;
+
+const char *displayModeName(DisplayMode mode) {
+  if (mode == MODE_CLAUDE) return "claude";
+  if (mode == MODE_CODEX) return "codex";
+  if (mode == MODE_NET) return "net";
+  if (mode == MODE_MUSIC) return "music";
+  if (mode == MODE_STOCK) return "stock";
+  return "auto";
+}
+
+bool parseDisplayMode(const String &name, DisplayMode &mode) {
+  if (name == "auto") mode = MODE_AUTO;
+  else if (name == "claude") mode = MODE_CLAUDE;
+  else if (name == "codex") mode = MODE_CODEX;
+  else if (name == "net") mode = MODE_NET;
+  else if (name == "music") mode = MODE_MUSIC;
+  else if (name == "stock") mode = MODE_STOCK;
+  else return false;
+  return true;
+}
 
 // When AUTO and the Mac reports audio playing, the screen auto-switches to the
 // music page and back when it stops — same spirit as the Claude/Codex auto
@@ -181,10 +220,17 @@ struct CodexStatus {
   float weeklyPct = -1;
   int weeklyResetMin = -1;
   bool needsInput = false;
+  String petState = "";
 };
 
 ClaudeStatus claudeStatus;
 CodexStatus codexStatus;
+
+// OpenPet-compatible event overlay. Existing Codex artwork remains the pet;
+// the event changes its label, border color and (for tool-running) animation.
+enum AgentEvent { EVENT_NONE, EVENT_THINKING, EVENT_TOOL_RUNNING, EVENT_REVIEWING, EVENT_SUCCESS, EVENT_FAILURE, EVENT_ATTENTION };
+AgentEvent agentEvent = EVENT_NONE;
+unsigned long agentEventDeadlineMs = 0;
 
 unsigned long lastPollMs = 0;
 unsigned long lastSuccessMs = 0;
@@ -197,11 +243,12 @@ bool webServerStarted = false; // deferred: port 80 clashes with the portal
 // firmware does the same. 0 = off, 100 = full. Persisted so it survives reboot.
 
 int brightness = BRIGHTNESS_DEFAULT; // 0-100
+bool screenOn = true; // USB bridge mirrors the Mac's physical display sleep state.
 
 void applyBrightness() {
   // analogWriteRange(100) is set in setup(), so the duty value is just the
   // inverted percentage (active LOW: 0 duty = always LOW = full on).
-  analogWrite(TFT_BL, 100 - brightness);
+  analogWrite(TFT_BL, screenOn ? 100 - brightness : 100);
 }
 
 void loadBrightness() {
@@ -217,6 +264,27 @@ void saveBrightness() {
   File f = LittleFS.open(BRIGHTNESS_FILE, "w");
   if (!f) return;
   f.println(brightness);
+  f.close();
+}
+
+// ---------- display mode persistence ----------
+
+void loadDisplayMode() {
+  if (!LittleFS.exists(DISPLAY_MODE_FILE)) return;
+  File f = LittleFS.open(DISPLAY_MODE_FILE, "r");
+  if (!f) return;
+  String savedMode = f.readStringUntil('\n');
+  savedMode.trim();
+  f.close();
+
+  DisplayMode mode;
+  if (parseDisplayMode(savedMode, mode)) displayMode = mode;
+}
+
+void saveDisplayMode() {
+  File f = LittleFS.open(DISPLAY_MODE_FILE, "w");
+  if (!f) return;
+  f.println(displayModeName(displayMode));
   f.close();
 }
 
@@ -239,16 +307,118 @@ void saveBridgeHost(const String &host) {
 
 // ---------- custom sprite loading ----------
 
+inline uint16_t swap565(uint16_t c) { return (uint16_t)((c << 8) | (c >> 8)); }
+
+uint16_t rgb332ToWire(uint8_t c) {
+  uint8_t r = ((c >> 5) * 255) / 7;
+  uint8_t g = (((c >> 2) & 7) * 255) / 7;
+  uint8_t b = ((c & 3) * 255) / 3;
+  return swap565((uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)));
+}
+
+uint8_t wire565ToRGB332(uint16_t wire) {
+  uint16_t c = swap565(wire);
+  uint8_t r = (c >> 8) & 0xF8;
+  uint8_t g = (c >> 3) & 0xFC;
+  uint8_t b = (c << 3) & 0xF8;
+  return (r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6);
+}
+
+// One-time conversion of pre-0.4.12 custom RGB565 files. The new RGB332
+// representation halves flash use so a full 57-frame Codex pet still fits.
+bool migrateLegacySprite(const char *path, int w, int h) {
+  if (!LittleFS.exists(path)) return true;
+  File in = LittleFS.open(path, "r");
+  if (!in || in.size() < 1) { if (in) in.close(); return false; }
+  char magic[3];
+  if (in.readBytes(magic, 3) == 3 && !memcmp(magic, "SP8", 3)) { in.close(); return true; }
+  in.seek(0);
+  uint8_t count = in.read();
+  size_t oldFrameBytes = (size_t)w * h * 2;
+  if (count == 0 || count > MAX_CUSTOM_FRAMES || (size_t)in.size() != 1 + (size_t)count * oldFrameBytes) {
+    in.close();
+    return false;
+  }
+  const char *temp = "/sprite.tmp";
+  File out = LittleFS.open(temp, "w");
+  if (!out) { in.close(); return false; }
+  out.write((const uint8_t *)"SP8", 3);
+  out.write(count);
+  for (int frame = 0; frame < count; frame++) {
+    for (int y = 0; y < h; y++) {
+      if (in.read((uint8_t *)rowBuf, (size_t)w * 2) != w * 2) {
+        in.close(); out.close(); LittleFS.remove(temp); return false;
+      }
+      for (int x = 0; x < w; x++) sprite8Row[x] = wire565ToRGB332(rowBuf[x]);
+      out.write(sprite8Row, w);
+    }
+    yield();
+  }
+  in.close();
+  out.close();
+  LittleFS.remove(path);
+  return LittleFS.rename(temp, path);
+}
+
+uint16_t readLE16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+uint32_t readLE32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t length) {
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320UL : 0);
+  }
+  return crc;
+}
+
+bool loadCodexPetFile(const char *path) {
+  codexPetCustom = false;
+  File f = LittleFS.open(path, "r");
+  if (!f || f.size() < AIPET_HEADER_BYTES) { if (f) f.close(); return false; }
+  uint8_t header[AIPET_HEADER_BYTES];
+  if (f.read(header, sizeof(header)) != sizeof(header) || memcmp(header, "AIPET1", 6) ||
+      readLE16(header + 6) != CODEX_PET_W || readLE16(header + 8) != CODEX_PET_H ||
+      header[10] != PET_STATE_COUNT || readLE32(header + 12) != (uint32_t)f.size()) {
+    f.close(); return false;
+  }
+  uint32_t expectedCRC = readLE32(header + 16);
+  uint32_t expectedOffset = AIPET_HEADER_BYTES;
+  for (int i = 0; i < PET_STATE_COUNT; i++) {
+    const uint8_t *entry = header + 20 + i * 12;
+    PetStateMeta meta = { entry[0], readLE16(entry + 2), readLE32(entry + 4), readLE32(entry + 8) };
+    if (meta.frames == 0 || meta.frames > 8 || meta.delayMs < 40 || meta.offset != expectedOffset ||
+        meta.length != (uint32_t)meta.frames * CODEX_PET_FRAME_BYTES_332) { f.close(); return false; }
+    codexPetStates[i] = meta;
+    expectedOffset += meta.length;
+  }
+  if (expectedOffset != (uint32_t)f.size()) { f.close(); return false; }
+  uint32_t crc = 0xFFFFFFFFUL;
+  while (f.available()) {
+    int n = f.read(sprite8Row, sizeof(sprite8Row));
+    if (n <= 0) break;
+    crc = crc32Update(crc, sprite8Row, n);
+    yield();
+  }
+  f.close();
+  if ((crc ^ 0xFFFFFFFFUL) != expectedCRC) return false;
+  codexPetCustom = true;
+  return true;
+}
+
 // Checks LittleFS for a previously-uploaded custom sprite and validates its
 // size before trusting it (frame count byte + exact expected byte length).
 void loadCustomSpriteState() {
+  migrateLegacySprite(CLAUDE_SPRITE_FILE, CLAUDE_SPRITE_W, CLAUDE_SPRITE_H);
+  migrateLegacySprite(CODEX_SPRITE_FILE, CODEX_SPRITE_W, CODEX_SPRITE_H);
   claudeCustom = false;
   if (LittleFS.exists(CLAUDE_SPRITE_FILE)) {
     File f = LittleFS.open(CLAUDE_SPRITE_FILE, "r");
-    if (f && f.size() >= 1) {
-      uint8_t cnt = f.read();
-      size_t expected = 1 + (size_t)cnt * CLAUDE_FRAME_BYTES;
-      if (cnt > 0 && cnt <= MAX_CUSTOM_FRAMES && (size_t)f.size() == expected) {
+    if (f && f.size() >= 4) {
+      char magic[3]; f.readBytes(magic, 3); uint8_t cnt = f.read();
+      size_t expected = 4 + (size_t)cnt * CLAUDE_FRAME_BYTES_332;
+      if (!memcmp(magic, "SP8", 3) && cnt > 0 && cnt <= MAX_CUSTOM_FRAMES && (size_t)f.size() == expected) {
         claudeCustom = true;
         claudeCustomFrames = cnt;
       }
@@ -259,10 +429,10 @@ void loadCustomSpriteState() {
   codexCustom = false;
   if (LittleFS.exists(CODEX_SPRITE_FILE)) {
     File f = LittleFS.open(CODEX_SPRITE_FILE, "r");
-    if (f && f.size() >= 1) {
-      uint8_t cnt = f.read();
-      size_t expected = 1 + (size_t)cnt * CODEX_FRAME_BYTES;
-      if (cnt > 0 && cnt <= MAX_CUSTOM_FRAMES && (size_t)f.size() == expected) {
+    if (f && f.size() >= 4) {
+      char magic[3]; f.readBytes(magic, 3); uint8_t cnt = f.read();
+      size_t expected = 4 + (size_t)cnt * CODEX_FRAME_BYTES_332;
+      if (!memcmp(magic, "SP8", 3) && cnt > 0 && cnt <= MAX_CUSTOM_FRAMES && (size_t)f.size() == expected) {
         codexCustom = true;
         codexCustomFrames = cnt;
       }
@@ -270,34 +440,53 @@ void loadCustomSpriteState() {
     if (f) f.close();
   }
 
-  Serial.printf("[sprite] claude custom=%d frames=%d | codex custom=%d frames=%d\n", claudeCustom,
-                claudeCustomFrames, codexCustom, codexCustomFrames);
+  loadCodexPetFile(CODEX_PET_FILE);
+
+  Serial.printf("[sprite] claude custom=%d frames=%d | codex custom=%d frames=%d pet=%d\n", claudeCustom,
+                claudeCustomFrames, codexCustom, codexCustomFrames, codexPetCustom);
 }
 
 int claudeFrameCount() { return claudeCustom ? claudeCustomFrames : CLAUDE_SPRITE_FRAMES; }
-int codexFrameCount() { return codexCustom ? codexCustomFrames : CODEX_SPRITE_FRAMES; }
+int codexFrameCount() {
+  if (codexPetCustom) return codexPetStates[codexPetState].frames;
+  return codexCustom ? codexCustomFrames : CODEX_SPRITE_FRAMES;
+}
 
-// Draws one sprite frame centered on screen, one row at a time so we never
-// need a full-frame buffer: each row comes either from the custom LittleFS
-// file (streamed) or the compiled-in PROGMEM default (copied row-by-row).
+// Draws one sprite frame in the right-hand pet pane. Each source row is
+// expanded with nearest-neighbor scaling, so the animation remains crisp
+// without needing a full-frame buffer.
+void drawScaledSpriteRow(int x0, int y, int dstW, int srcW) {
+  for (int x = 0; x < dstW; x++) scaledRowBuf[x] = rowBuf[x * srcW / dstW];
+  tft.pushImage(x0, y, dstW, 1, scaledRowBuf);
+}
+
 void drawSpriteFrame(bool custom, const char *file, const uint16_t *const *progmemFrames, int frameIdx, int w,
                      int h, size_t frameBytes) {
-  int x0 = SCREEN_CX - w / 2, y0 = SCREEN_CY - h / 2;
+  int dstW = PET_W, dstH = h * PET_W / w;
+  int x0 = PET_CX - dstW / 2, y0 = SCREEN_CY - dstH / 2;
   size_t rowBytes = (size_t)w * 2;
   if (custom) {
     File f = LittleFS.open(file, "r");
     if (!f) return;
-    f.seek(1 + (size_t)frameIdx * frameBytes);
-    for (int r = 0; r < h; r++) {
-      f.read((uint8_t *)rowBuf, rowBytes);
-      tft.pushImage(x0, y0 + r, w, 1, rowBuf);
+    size_t frameBytes332 = (size_t)w * h;
+    int sourceRow = -1;
+    for (int r = 0; r < dstH; r++) {
+      int srcY = r * h / dstH;
+      if (srcY != sourceRow) {
+        sourceRow = srcY;
+        f.seek(4 + (size_t)frameIdx * frameBytes332 + (size_t)srcY * w);
+        f.read(sprite8Row, w);
+      }
+      for (int x = 0; x < w; x++) rowBuf[x] = rgb332ToWire(sprite8Row[x]);
+      drawScaledSpriteRow(x0, y0 + r, dstW, w);
     }
     f.close();
   } else {
     const uint16_t *frame = progmemFrames[frameIdx];
-    for (int r = 0; r < h; r++) {
-      memcpy_P(rowBuf, frame + (size_t)r * w, rowBytes);
-      tft.pushImage(x0, y0 + r, w, 1, rowBuf);
+    for (int r = 0; r < dstH; r++) {
+      int srcY = r * h / dstH;
+      memcpy_P(rowBuf, frame + (size_t)srcY * w, rowBytes);
+      drawScaledSpriteRow(x0, y0 + r, dstW, w);
     }
   }
 }
@@ -331,18 +520,125 @@ bool bridgeStale() {
   return (millis() - lastSuccessMs) >= 2UL * BRIDGE_POLL_INTERVAL_MS;
 }
 
+bool agentEventActive() {
+  return agentEvent != EVENT_NONE && (long)(millis() - agentEventDeadlineMs) < 0;
+}
+
+const char *agentEventLabel() {
+  switch (agentEvent) {
+    case EVENT_THINKING: return "THINK";
+    case EVENT_TOOL_RUNNING: return "TOOL";
+    case EVENT_REVIEWING: return "REVIEW";
+    case EVENT_SUCCESS: return "DONE";
+    case EVENT_FAILURE: return "FAIL";
+    case EVENT_ATTENTION: return "INPUT";
+    default: return "";
+  }
+}
+
+uint16_t agentEventColor() {
+  switch (agentEvent) {
+    case EVENT_THINKING: return TFT_CYAN;
+    case EVENT_REVIEWING: return TFT_ORANGE;
+    case EVENT_FAILURE: return TFT_RED;
+    case EVENT_ATTENTION: return TFT_RED;
+    default: return TFT_GREEN;
+  }
+}
+
+bool setAgentEvent(const char *name, int ttlMs) {
+  if (!strcmp(name, "thinking")) agentEvent = EVENT_THINKING;
+  else if (!strcmp(name, "tool-running")) agentEvent = EVENT_TOOL_RUNNING;
+  else if (!strcmp(name, "reviewing")) agentEvent = EVENT_REVIEWING;
+  else if (!strcmp(name, "success")) agentEvent = EVENT_SUCCESS;
+  else if (!strcmp(name, "failure")) agentEvent = EVENT_FAILURE;
+  else if (!strcmp(name, "attention")) agentEvent = EVENT_ATTENTION;
+  else return false;
+  agentEventDeadlineMs = millis() + constrain(ttlMs, 250, 600000);
+  return true;
+}
+
+const char *petStateName(PetState state) {
+  static const char *names[PET_STATE_COUNT] = { "idle", "running-right", "running-left", "waving", "jumping",
+                                                "failed", "waiting", "running", "review" };
+  return names[state];
+}
+
+bool parsePetState(const String &name, PetState &state) {
+  for (int i = 0; i < PET_STATE_COUNT; i++) {
+    if (name == petStateName((PetState)i)) { state = (PetState)i; return true; }
+  }
+  return false;
+}
+
+bool petStateOverrideActive() {
+  return (long)(millis() - petStateOverrideDeadlineMs) < 0;
+}
+
+PetState desiredCodexPetState() {
+  if (petStateOverrideActive()) return petStateOverride;
+  if (codexStatus.needsInput) return PET_WAITING;
+  if (agentEventActive()) {
+    if (agentEvent == EVENT_ATTENTION) return PET_WAITING;
+    if (agentEvent == EVENT_REVIEWING) return PET_REVIEW;
+    if (agentEvent == EVENT_FAILURE) return PET_FAILED;
+    if (agentEvent == EVENT_SUCCESS) return PET_JUMPING;
+    if (agentEvent == EVENT_THINKING || agentEvent == EVENT_TOOL_RUNNING) return PET_RUNNING;
+  }
+  PetState bridgeState;
+  if (parsePetState(codexStatus.petState, bridgeState)) return bridgeState;
+  return codexStatus.status == "working" ? PET_RUNNING : PET_IDLE;
+}
+
 // True when the app currently on screen is waiting on a permission/approval
 // prompt — drives the red "look now, act" border flash.
 bool currentAppNeedsInput() {
-  return currentApp == APP_CLAUDE ? claudeStatus.needsInput : codexStatus.needsInput;
+  if (currentApp == APP_CLAUDE) return claudeStatus.needsInput;
+  return agentEventActive() && agentEvent == EVENT_ATTENTION;
 }
 
-// Working vs idle is now conveyed by the sprite animation itself (moving vs
-// still), not by ring color. The ring just stays steady green, except
-// bridge-stale which flashes red ("check it now") and overrides everything.
-uint16_t currentStatusColor() {
-  if (bridgeStale()) return flashOn ? TFT_RED : TFT_BLACK;
+// The quota ring doubles as a status light. Idle is the only steady state;
+// every other state flashes in its semantic color while retaining the quota
+// percentage as the illuminated length.
+uint16_t codexStateColor(PetState state) {
+  switch (state) {
+    case PET_FAILED: return TFT_RED;
+    case PET_WAITING: return TFT_GREEN;
+    case PET_REVIEW: return TFT_ORANGE;
+    case PET_WAVING: return TFT_YELLOW;
+    case PET_RUNNING:
+    case PET_RUNNING_LEFT:
+    case PET_RUNNING_RIGHT: return TFT_CYAN;
+    default: return TFT_GREEN; // idle and successful jumping
+  }
+}
+
+bool currentStatusFlashes() {
+  if (currentAppNeedsInput() || (everPolled && bridgeStale())) return true;
+  if (currentApp == APP_CODEX) {
+    if (agentEventActive()) return true;
+    PetState state = desiredCodexPetState();
+    return state != PET_IDLE && state != PET_WAITING;
+  }
+  return claudeStatus.status == "working" || claudeStatus.status == "waiting" ||
+         claudeStatus.status == "offline";
+}
+
+uint16_t currentStatusBaseColor() {
+  if (currentAppNeedsInput() || (everPolled && bridgeStale())) return TFT_RED;
+  if (currentApp == APP_CODEX) {
+    if (agentEventActive()) return agentEventColor();
+    return codexStateColor(desiredCodexPetState());
+  }
+  if (claudeStatus.status == "working") return TFT_CYAN;
+  if (claudeStatus.status == "waiting") return TFT_RED;
+  if (claudeStatus.status == "offline") return TFT_RED;
   return TFT_GREEN;
+}
+
+uint16_t currentStatusColor() {
+  if (currentStatusFlashes() && !flashOn) return TFT_BLACK;
+  return currentStatusBaseColor();
 }
 
 // The ring is skipped when nothing changed (see drawSquareRing) so the 5s
@@ -415,6 +711,27 @@ void drawClaudeSprite(int frameIdx) {
 }
 
 void drawCodexSprite(int frameIdx) {
+  if (codexPetCustom) {
+    const PetStateMeta &meta = codexPetStates[codexPetState];
+    File f = LittleFS.open(CODEX_PET_FILE, "r");
+    if (!f) return;
+    const int dstW = PET_W, dstH = CODEX_PET_H * PET_W / CODEX_PET_W;
+    const int x0 = PET_CX - dstW / 2, y0 = SCREEN_CY - dstH / 2;
+    int sourceRow = -1;
+    for (int y = 0; y < dstH; y++) {
+      int srcY = y * CODEX_PET_H / dstH;
+      if (srcY != sourceRow) {
+        sourceRow = srcY;
+        f.seek(meta.offset + (size_t)frameIdx * CODEX_PET_FRAME_BYTES_332 +
+               (size_t)srcY * CODEX_PET_W);
+        if (f.read(sprite8Row, CODEX_PET_W) != CODEX_PET_W) break;
+      }
+      for (int x = 0; x < CODEX_PET_W; x++) rowBuf[x] = rgb332ToWire(sprite8Row[x]);
+      drawScaledSpriteRow(x0, y0 + y, dstW, CODEX_PET_W);
+    }
+    f.close();
+    return;
+  }
   drawSpriteFrame(codexCustom, CODEX_SPRITE_FILE, codex_sprite_frames, frameIdx, CODEX_SPRITE_W, CODEX_SPRITE_H,
                   CODEX_FRAME_BYTES);
 }
@@ -423,17 +740,14 @@ String pctText(float pct) {
   return pct >= 0 ? String((int)pct) + "%" : "-";
 }
 
-// Quota readout below the sprite: two columns ("5h" / "Wk"), small grey label
-// over a big font-4 percentage. Values repaint only when their text changes
-// (force = after a full-screen clear), so the 5s poll never flashes them.
-const int QUOTA_LABEL_Y = 183, QUOTA_VALUE_Y = 199;
-const int QUOTA_COL1_X = 70, QUOTA_COL2_X = 170;
+// Quota readout in the left sidebar. Values repaint only when their text
+// changes (force = after a full-screen clear), so the 5s poll never flashes.
+const int QUOTA_5H_LABEL_Y = 66, QUOTA_5H_VALUE_Y = 78;
+const int QUOTA_WK_LABEL_Y = 174, QUOTA_WK_VALUE_Y = 200;
 String lastQuota5h, lastQuotaWk;
 
 // pushImage() colors must be pre-byte-swapped (this firmware never enables
 // setSwapBytes; see the sprite pipeline). Natural RGB565 -> wire order:
-inline uint16_t swap565(uint16_t c) { return (uint16_t)((c << 8) | (c >> 8)); }
-
 // ---- Nothing-phone-style dot-matrix font (NDot look) ----
 // Every piece of ASCII text on the device renders as round dots on a fixed
 // grid with visible gaps. Proportional: each glyph is up to 5 columns wide
@@ -625,33 +939,34 @@ void drawQuotaText(float hourPct, float weekPct, bool force) {
   if ((int8_t)single != lastSingle) {
     lastSingle = (int8_t)single;
     force = true;
-    tft.fillRect(0, QUOTA_LABEL_Y, 240, QUOTA_VALUE_Y + 22 - QUOTA_LABEL_Y, TFT_BLACK);
+    tft.fillRect(15, QUOTA_5H_LABEL_Y, 58, QUOTA_5H_VALUE_Y + 22 - QUOTA_5H_LABEL_Y, TFT_BLACK);
+    tft.fillRect(15, QUOTA_WK_LABEL_Y, 58, QUOTA_WK_VALUE_Y + 22 - QUOTA_WK_LABEL_Y, TFT_BLACK);
   }
   if (single) {
-    if (force) drawSqTextC("Wk", 120, QUOTA_LABEL_Y, 2, 2, TFT_LIGHTGREY);
+    if (force) drawSqTextC("Wk", SIDEBAR_CX, QUOTA_WK_LABEL_Y, 2, 2, TFT_LIGHTGREY);
     String v = pctText(weekPct);
     if (force || v != lastQuotaWk) {
       lastQuotaWk = v;
       lastQuota5h = "";
-      tft.fillRect(120 - 50, QUOTA_VALUE_Y, 100, 22, TFT_BLACK);
-      drawDotTextC(v, 120, QUOTA_VALUE_Y, 3, 1, TFT_WHITE);
+      tft.fillRect(15, QUOTA_WK_VALUE_Y, 58, 22, TFT_BLACK);
+      drawSqTextC(v, SIDEBAR_CX, QUOTA_WK_VALUE_Y, 3, 2, TFT_WHITE);
     }
     return;
   }
   if (force) {
-    drawSqTextC("5h", QUOTA_COL1_X, QUOTA_LABEL_Y, 2, 2, TFT_LIGHTGREY);
-    drawSqTextC("Wk", QUOTA_COL2_X, QUOTA_LABEL_Y, 2, 2, TFT_LIGHTGREY);
+    drawSqTextC("5h", SIDEBAR_CX, QUOTA_5H_LABEL_Y, 2, 2, TFT_LIGHTGREY);
+    drawSqTextC("Wk", SIDEBAR_CX, QUOTA_WK_LABEL_Y, 2, 2, TFT_LIGHTGREY);
   }
   String v1 = pctText(hourPct), v2 = pctText(weekPct);
   if (force || v1 != lastQuota5h) {
     lastQuota5h = v1;
-    tft.fillRect(QUOTA_COL1_X - 50, QUOTA_VALUE_Y, 100, 22, TFT_BLACK);
-    drawDotTextC(v1, QUOTA_COL1_X, QUOTA_VALUE_Y, 3, 1, TFT_WHITE);
+    tft.fillRect(15, QUOTA_5H_VALUE_Y, 58, 22, TFT_BLACK);
+    drawDotTextC(v1, SIDEBAR_CX, QUOTA_5H_VALUE_Y, 2, 1, TFT_WHITE);
   }
   if (force || v2 != lastQuotaWk) {
     lastQuotaWk = v2;
-    tft.fillRect(QUOTA_COL2_X - 50, QUOTA_VALUE_Y, 100, 22, TFT_BLACK);
-    drawDotTextC(v2, QUOTA_COL2_X, QUOTA_VALUE_Y, 3, 1, TFT_WHITE);
+    tft.fillRect(15, QUOTA_WK_VALUE_Y, 58, 22, TFT_BLACK);
+    drawSqTextC(v2, SIDEBAR_CX, QUOTA_WK_VALUE_Y, 3, 2, TFT_WHITE);
   }
 }
 
@@ -727,11 +1042,11 @@ void drawCountdown(bool force) {
   // A length change ("100:00" -> "99:59:59") shifts every glyph cell, so the
   // whole region must clear; otherwise same-length digits line up 1:1.
   if (t.length() != lastCountdown.length()) force = true;
-  const int P = 6, R = 2, VAL_Y = 100; // countdown dot metrics
-  int x = SCREEN_CX - dotTextWidth(t, P, R) / 2;
+  const int P = 4, R = 1, VAL_Y = 106; // countdown dot metrics
+  int x = PET_CX - dotTextWidth(t, P, R) / 2;
   if (force) {
-    tft.fillRect(SCREEN_CX - 99, 66, 198, 84, TFT_BLACK);
-    drawDotTextC(showingCd == CD_WEEK ? "Wk RESET IN" : "5h RESET IN", SCREEN_CX, 72, 2, 0,
+    tft.fillRect(80, 66, 146, 84, TFT_BLACK);
+    drawDotTextC(showingCd == CD_WEEK ? "Wk RESET IN" : "5h RESET IN", PET_CX, 78, 2, 0,
                  TFT_LIGHTGREY);
     drawDotText(t, x, VAL_Y, P, R, TFT_ORANGE);
   } else {
@@ -753,7 +1068,7 @@ void drawCountdown(bool force) {
 // which app the screen is currently showing. Drawn row-by-row from PROGMEM
 // through rowBuf, same as the sprite path. (A dotted-logo experiment got
 // reverted: at 40px the sampled dots were unrecognizable.)
-const int LOGO_X = 14, LOGO_Y = 18;
+const int LOGO_X = 24, LOGO_Y = 17;
 
 void drawAppLogo() {
   const uint16_t *logo = (currentApp == APP_CLAUDE) ? claude_logo_0 : codex_logo_0;
@@ -765,12 +1080,18 @@ void drawAppLogo() {
   }
 }
 
-// Days until the weekly window resets, top-right corner inside the ring
-// (mirrors the app logo top-left). Weekly only - the 5h window is too short
-// for a day count to say anything. Under a day it degrades to hours.
-// The x extent (166..225) stays clear of both the ring (>=226) and the
-// sprite (x<=180 but only from y=60 down); the value must end above y=60.
-const int RESET_CX = 198, RESET_LABEL_Y = 18, RESET_VALUE_Y = 33;
+void drawAgentEventLabel() {
+  tft.fillRect(90, 15, 132, 20, TFT_BLACK);
+  if (!agentEventActive()) return;
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(agentEventColor(), TFT_BLACK);
+  tft.drawString(agentEventLabel(), PET_CX, 19, 2);
+}
+
+// Days until the weekly window resets in the left sidebar. Weekly only - the
+// 5h window is too short for a day count to say anything. Under a day it
+// degrades to hours.
+const int RESET_CX = SIDEBAR_CX, RESET_LABEL_Y = 105, RESET_VALUE_Y = 120;
 String lastResetDays;
 
 String resetDaysText(int min) {
@@ -783,7 +1104,7 @@ void drawResetDays(bool force) {
   String t = resetDaysText(currentWeekResetMin());
   if (!force && t == lastResetDays) return;
   lastResetDays = t;
-  tft.fillRect(RESET_CX - 32, RESET_LABEL_Y, 60, RESET_VALUE_Y + 27 - RESET_LABEL_Y, TFT_BLACK);
+  tft.fillRect(15, RESET_LABEL_Y, 58, RESET_VALUE_Y + 27 - RESET_LABEL_Y, TFT_BLACK);
   if (t.length() == 0) return;
   drawTinyBoldText("RESET", RESET_CX, RESET_LABEL_Y, TFT_LIGHTGREY);
   // 2 chars ("3d") get big 3px dots; 3 chars ("18h") drop a size to fit.
@@ -829,6 +1150,7 @@ void drawActiveApp() {
   if (showingCd != CD_NONE) drawCountdown(true);
   drawAppLogo();
   drawResetDays(true);
+  drawAgentEventLabel();
 }
 
 // In-place refresh after a bridge poll: ring repaint + only the text that
@@ -846,6 +1168,7 @@ void refreshActiveApp() {
     drawQuotaText(codexStatus.primaryPct, codexStatus.weeklyPct, false);
   }
   drawResetDays(false);
+  drawAgentEventLabel();
   if (showingCd != CD_NONE) {
     syncCountdownDeadline();
     drawCountdown(false);
@@ -873,6 +1196,8 @@ bool updateActiveApp() {
   if (displayMode == MODE_CLAUDE) {
     desired = APP_CLAUDE;
   } else if (displayMode == MODE_CODEX) {
+    desired = APP_CODEX;
+  } else if (agentEventActive()) {
     desired = APP_CODEX;
   } else if (claudeStatus.needsInput && !codexStatus.needsInput) {
     desired = APP_CLAUDE; // approval prompt wins the screen
@@ -1513,6 +1838,7 @@ bool parseStatusJson(const String &payload) {
     codexStatus.weeklyPct = x["weekly_pct"] | -1.0;
     codexStatus.weeklyResetMin = x["weekly_reset_min"] | -1;
     codexStatus.needsInput = x["needs_input"] | false;
+    codexStatus.petState = x["pet_state"] | "";
   }
   statusMusicPlaying = doc["music_playing"] | false;
   return true;
@@ -1523,7 +1849,7 @@ bool parseStatusJson(const String &payload) {
 // music page.
 DisplayMode effectiveMode() {
   if (displayMode == MODE_AUTO) {
-    if (claudeStatus.needsInput || codexStatus.needsInput) return MODE_AUTO;
+    if (claudeStatus.needsInput || codexStatus.needsInput || agentEventActive()) return MODE_AUTO;
     // music page needs HTTP for cover/text bitmaps, so don't auto-promote
     // when running wired-only (no WiFi)
     if (statusMusicPlaying && WiFi.status() == WL_CONNECTED) return MODE_MUSIC;
@@ -1585,8 +1911,116 @@ unsigned long lastSerialFrameMs = 0;
 bool wiredEverLinked = false;
 char serialLine[1600]; // biggest frame is #STATUS at ~600 bytes
 size_t serialLineLen = 0;
+File serialPetFile;
+bool serialPetUploading = false;
+uint32_t serialPetExpectedBytes = 0;
+uint32_t serialPetReceivedBytes = 0;
+uint32_t serialPetExpectedCRC = 0;
+uint32_t serialPetCRC = 0xFFFFFFFFUL;
+int serialPetNextSeq = 0;
+uint8_t serialPetChunk[768];
 
 bool wiredActive() { return wiredEverLinked && (millis() - lastSerialFrameMs) < 15000UL; }
+
+void serialAck(int id, bool ok, const char *error = nullptr) {
+  if (id < 0) return; // keep the old one-way bridge protocol compatible
+  JsonDocument doc;
+  doc["id"] = id;
+  doc["ok"] = ok;
+  doc["brightness"] = brightness;
+  doc["screen_on"] = screenOn;
+  doc["display"] = displayModeName(displayMode);
+  if (agentEventActive()) doc["event"] = agentEventLabel();
+  if (error) doc["error"] = error;
+  Serial.print("#ACK ");
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void serialInfo(int id) {
+  JsonDocument doc;
+  doc["id"] = id;
+  doc["brightness"] = brightness;
+  doc["screen_on"] = screenOn;
+  doc["display"] = displayModeName(displayMode);
+  doc["effective"] = displayModeName(effectiveMode());
+  doc["wired"] = wiredActive();
+  doc["fw"] = FW_VERSION;
+  doc["custom_pet"] = codexPetCustom;
+  doc["pet_state"] = petStateName(codexPetState);
+  Serial.print("#INFO ");
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void abortSerialPetUpload() {
+  if (serialPetFile) serialPetFile.close();
+  serialPetUploading = false;
+  serialPetExpectedBytes = 0;
+  serialPetReceivedBytes = 0;
+  serialPetNextSeq = 0;
+  LittleFS.remove(CODEX_PET_TEMP_FILE);
+}
+
+int base64Value(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+int decodeBase64Chunk(const char *src, uint8_t *dst, size_t capacity) {
+  size_t len = strlen(src);
+  if (len == 0 || len % 4 != 0) return -1;
+  size_t out = 0;
+  for (size_t i = 0; i < len; i += 4) {
+    int a = base64Value(src[i]);
+    int b = base64Value(src[i + 1]);
+    int c = src[i + 2] == '=' ? -2 : base64Value(src[i + 2]);
+    int d = src[i + 3] == '=' ? -2 : base64Value(src[i + 3]);
+    if (a < 0 || b < 0 || c == -1 || d == -1 || (c == -2 && d != -2) ||
+        ((c == -2 || d == -2) && i + 4 != len)) return -1;
+    if (out >= capacity) return -1;
+    dst[out++] = (uint8_t)((a << 2) | (b >> 4));
+    if (c != -2) {
+      if (out >= capacity) return -1;
+      dst[out++] = (uint8_t)((b << 4) | (c >> 2));
+    }
+    if (d != -2) {
+      if (out >= capacity) return -1;
+      dst[out++] = (uint8_t)((c << 6) | d);
+    }
+  }
+  return (int)out;
+}
+
+bool installCodexPetTemp(String &error) {
+  if (!loadCodexPetFile(CODEX_PET_TEMP_FILE)) {
+    LittleFS.remove(CODEX_PET_TEMP_FILE);
+    codexPetCustom = false;
+    error = "invalid AIPET1";
+    return false;
+  }
+  codexPetCustom = false;
+  LittleFS.remove(CODEX_PET_FILE);
+  if (!LittleFS.rename(CODEX_PET_TEMP_FILE, CODEX_PET_FILE) || !loadCodexPetFile(CODEX_PET_FILE)) {
+    LittleFS.remove(CODEX_PET_TEMP_FILE);
+    LittleFS.remove(CODEX_PET_FILE);
+    codexPetCustom = false;
+    error = "install failed";
+    return false;
+  }
+  LittleFS.remove(CODEX_SPRITE_FILE);
+  codexCustom = false;
+  codexCustomFrames = 0;
+  codexPetState = desiredCodexPetState();
+  codexFrame = 0;
+  spriteRev++;
+  if (currentApp == APP_CODEX) drawActiveApp();
+  return true;
+}
 
 // First data over either transport replaces the boot/portal screen.
 void showMainUiIfNeeded() {
@@ -1601,7 +2035,12 @@ void handleSerialFrame(char *line) {
   lastSerialFrameMs = millis();
   wiredEverLinked = true;
   if (!strncmp(line, "#HELLO", 6)) {
-    Serial.printf("#DEVICE {\"name\":\"aiclock\",\"fw\":\"%s\"}\n", FW_VERSION);
+    Serial.printf("#DEVICE {\"name\":\"aiclock\",\"fw\":\"%s\",\"protocol\":3}\n", FW_VERSION);
+    return;
+  }
+  if (!strncmp(line, "#INFO? ", 7)) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, line + 7) && doc["id"].is<int>()) serialInfo(doc["id"].as<int>());
     return;
   }
   if (!strncmp(line, "#STATUS ", 8)) {
@@ -1625,25 +2064,124 @@ void handleSerialFrame(char *line) {
     handleStockPayload(String(line + 7));
     return;
   }
+  if (!strncmp(line, "#PET_BEGIN ", 11)) {
+    JsonDocument doc;
+    if (deserializeJson(doc, line + 11)) return;
+    int id = doc["id"] | -1;
+    uint32_t bytes = doc["bytes"] | 0;
+    if (!doc["crc32"].is<uint32_t>()) { serialAck(id, false, "invalid pet checksum"); return; }
+    uint32_t crc = doc["crc32"].as<uint32_t>();
+    if (bytes != CODEX_PET_DEVICE_BYTES) { serialAck(id, false, "invalid pet size"); return; }
+    abortSerialPetUpload();
+    LittleFS.remove(CODEX_PET_FILE);
+    LittleFS.remove(CODEX_SPRITE_FILE);
+    codexPetCustom = false;
+    codexCustom = false;
+    serialPetFile = LittleFS.open(CODEX_PET_TEMP_FILE, "w");
+    if (!serialPetFile) { serialAck(id, false, "storage open failed"); return; }
+    serialPetUploading = true;
+    serialPetExpectedBytes = bytes;
+    serialPetReceivedBytes = 0;
+    serialPetExpectedCRC = crc;
+    serialPetCRC = 0xFFFFFFFFUL;
+    serialPetNextSeq = 0;
+    serialAck(id, true);
+    return;
+  }
+  if (!strncmp(line, "#PET_CHUNK ", 11)) {
+    JsonDocument doc;
+    if (deserializeJson(doc, line + 11)) return;
+    int id = doc["id"] | -1;
+    int seq = doc["seq"] | -1;
+    const char *encoded = doc["data"] | (const char *)nullptr;
+    if (!serialPetUploading || !encoded) { serialAck(id, false, "no pet upload"); return; }
+    if (seq != serialPetNextSeq) { abortSerialPetUpload(); serialAck(id, false, "bad chunk sequence"); return; }
+    int decoded = decodeBase64Chunk(encoded, serialPetChunk, sizeof(serialPetChunk));
+    if (decoded <= 0 || serialPetReceivedBytes + decoded > serialPetExpectedBytes ||
+        serialPetFile.write(serialPetChunk, decoded) != (size_t)decoded) {
+      abortSerialPetUpload(); serialAck(id, false, "chunk write failed"); return;
+    }
+    serialPetCRC = crc32Update(serialPetCRC, serialPetChunk, decoded);
+    serialPetReceivedBytes += decoded;
+    serialPetNextSeq++;
+    serialAck(id, true);
+    return;
+  }
+  if (!strncmp(line, "#PET_END ", 9)) {
+    JsonDocument doc;
+    if (deserializeJson(doc, line + 9)) return;
+    int id = doc["id"] | -1;
+    if (!serialPetUploading) { serialAck(id, false, "no pet upload"); return; }
+    serialPetFile.close();
+    serialPetUploading = false;
+    if (serialPetReceivedBytes != serialPetExpectedBytes ||
+        (serialPetCRC ^ 0xFFFFFFFFUL) != serialPetExpectedCRC) {
+      uint32_t actualCRC = serialPetCRC ^ 0xFFFFFFFFUL;
+      char detail[96];
+      snprintf(detail, sizeof(detail), "pet checksum failed (expected %08lx, got %08lx)",
+               (unsigned long)serialPetExpectedCRC, (unsigned long)actualCRC);
+      abortSerialPetUpload(); serialAck(id, false, detail); return;
+    }
+    String error;
+    bool ok = installCodexPetTemp(error);
+    serialAck(id, ok, ok ? nullptr : error.c_str());
+    return;
+  }
   if (!strncmp(line, "#CMD ", 5)) {
     JsonDocument doc;
     if (deserializeJson(doc, line + 5)) return;
+    int id = doc["id"].is<int>() ? doc["id"].as<int>() : -1;
+    bool changed = false;
     if (doc["brightness"].is<int>()) {
       brightness = constrain(doc["brightness"].as<int>(), 0, 100);
       applyBrightness();
       saveBrightness();
+      changed = true;
+    }
+    const char *screen = doc["screen"] | (const char *)nullptr;
+    if (screen) {
+      if (!strcmp(screen, "on")) screenOn = true;
+      else if (!strcmp(screen, "off")) screenOn = false;
+      else { serialAck(id, false, "invalid screen"); return; }
+      applyBrightness();
+      changed = true;
     }
     const char *mode = doc["display"] | (const char *)nullptr;
     if (mode) {
-      String m(mode);
-      if (m == "auto") displayMode = MODE_AUTO;
-      else if (m == "claude") displayMode = MODE_CLAUDE;
-      else if (m == "codex") displayMode = MODE_CODEX;
-      else if (m == "net") displayMode = MODE_NET;
-      else if (m == "music") displayMode = MODE_MUSIC;
-      else if (m == "stock") displayMode = MODE_STOCK;
+      DisplayMode requestedMode;
+      if (!parseDisplayMode(String(mode), requestedMode)) {
+        serialAck(id, false, "invalid display");
+        return;
+      }
+      if (displayMode != requestedMode) {
+        displayMode = requestedMode;
+        saveDisplayMode();
+      }
+      changed = true;
       // the effectiveMode transition handler in loop() repaints the chrome
     }
+    const char *event = doc["event"] | (const char *)nullptr;
+    if (event) {
+      if (!setAgentEvent(event, doc["ttl_ms"] | 4000)) { serialAck(id, false, "invalid event"); return; }
+      changed = true;
+      showMainUiIfNeeded();
+      DisplayMode eff = effectiveMode();
+      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
+        updateActiveApp();
+        drawActiveApp();
+      }
+    }
+    if (doc["pet_reset"] | false) {
+      abortSerialPetUpload();
+      LittleFS.remove(CODEX_PET_FILE);
+      LittleFS.remove(CODEX_SPRITE_FILE);
+      loadCustomSpriteState();
+      codexFrame = 0;
+      spriteRev++;
+      if (currentApp == APP_CODEX) drawActiveApp();
+      changed = true;
+    }
+    serialAck(id, changed, changed ? nullptr : "empty command");
     return;
   }
 }
@@ -1759,15 +2297,6 @@ void handleSave() {
 
 // ---------- JSON API for the Mac app ----------
 
-const char *displayModeName(DisplayMode m) {
-  if (m == MODE_CLAUDE) return "claude";
-  if (m == MODE_CODEX) return "codex";
-  if (m == MODE_NET) return "net";
-  if (m == MODE_MUSIC) return "music";
-  if (m == MODE_STOCK) return "stock";
-  return "auto";
-}
-
 void handleApiInfo() {
   JsonDocument doc;
   doc["ip"] = WiFi.localIP().toString();
@@ -1779,6 +2308,13 @@ void handleApiInfo() {
   doc["showing"] = (currentApp == APP_CLAUDE) ? "claude" : "codex";
   doc["last_update_s"] = everPolled ? (long)((millis() - lastSuccessMs) / 1000) : -1;
   doc["sprite_rev"] = spriteRev;
+  doc["pet_format"] = codexPetCustom ? "AIPET1" : "legacy";
+  doc["pet_state"] = petStateName(codexPetState);
+  doc["pet_delay_ms"] = codexPetCustom ? codexPetStates[codexPetState].delayMs : ANIM_INTERVAL_MS;
+  JsonArray petStates = doc["pet_states"].to<JsonArray>();
+  if (codexPetCustom) {
+    for (int i = 0; i < PET_STATE_COUNT; i++) petStates.add(petStateName((PetState)i));
+  }
   doc["brightness"] = brightness;
   doc["wired"] = wiredActive(); // true = data currently arrives over USB serial
   doc["fw"] = FW_VERSION;
@@ -1789,9 +2325,10 @@ void handleApiInfo() {
   c["h"] = CLAUDE_SPRITE_H;
   JsonObject x = doc["codex"].to<JsonObject>();
   x["status"] = codexStatus.status;
-  x["custom_sprite"] = codexCustom;
-  x["w"] = CODEX_SPRITE_W;
-  x["h"] = CODEX_SPRITE_H;
+  x["custom_sprite"] = codexCustom || codexPetCustom;
+  x["custom_pet"] = codexPetCustom;
+  x["w"] = codexPetCustom ? CODEX_PET_W : CODEX_SPRITE_W;
+  x["h"] = codexPetCustom ? CODEX_PET_H : CODEX_SPRITE_H;
   String out;
   serializeJson(doc, out);
   webServer.send(200, "application/json", out);
@@ -1799,15 +2336,14 @@ void handleApiInfo() {
 
 void handleApiDisplay() {
   String mode = webServer.arg("mode");
-  if (mode == "auto") displayMode = MODE_AUTO;
-  else if (mode == "claude") displayMode = MODE_CLAUDE;
-  else if (mode == "codex") displayMode = MODE_CODEX;
-  else if (mode == "net") displayMode = MODE_NET;
-  else if (mode == "music") displayMode = MODE_MUSIC;
-  else if (mode == "stock") displayMode = MODE_STOCK;
-  else {
+  DisplayMode requestedMode;
+  if (!parseDisplayMode(mode, requestedMode)) {
     webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock");
     return;
+  }
+  if (displayMode != requestedMode) {
+    displayMode = requestedMode;
+    saveDisplayMode();
   }
   Serial.printf("[api] display mode = %s\n", mode.c_str());
   if (displayMode == MODE_NET) {
@@ -1862,17 +2398,41 @@ void handleApiBridge() {
 void handleSpriteRaw(ActiveApp slot) {
   bool custom = (slot == APP_CLAUDE) ? claudeCustom : codexCustom;
   const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
-  if (custom) {
-    File f = LittleFS.open(binPath, "r");
-    if (f) {
-      webServer.streamFile(f, "application/octet-stream");
-      f.close();
-      return;
-    }
-  }
   int frames = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FRAMES : CODEX_SPRITE_FRAMES;
   int w = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_W : CODEX_SPRITE_W;
   int h = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_H : CODEX_SPRITE_H;
+  File rgb332;
+  uint32_t rgb332Offset = 0;
+  if (slot == APP_CODEX && codexPetCustom) {
+    const PetStateMeta &meta = codexPetStates[codexPetState];
+    frames = meta.frames;
+    w = CODEX_PET_W;
+    h = CODEX_PET_H;
+    rgb332Offset = meta.offset;
+    rgb332 = LittleFS.open(CODEX_PET_FILE, "r");
+  } else if (custom) {
+    frames = (slot == APP_CLAUDE) ? claudeCustomFrames : codexCustomFrames;
+    rgb332Offset = 4;
+    rgb332 = LittleFS.open(binPath, "r");
+  }
+  if (rgb332) {
+    size_t frameBytes565 = (size_t)w * h * 2;
+    webServer.setContentLength(1 + (size_t)frames * frameBytes565);
+    webServer.send(200, "application/octet-stream", "");
+    uint8_t cnt = (uint8_t)frames;
+    webServer.sendContent((const char *)&cnt, 1);
+    rgb332.seek(rgb332Offset);
+    for (int frame = 0; frame < frames; frame++) {
+      for (int y = 0; y < h; y++) {
+        if (rgb332.read(sprite8Row, w) != w) break;
+        for (int x = 0; x < w; x++) rowBuf[x] = rgb332ToWire(sprite8Row[x]);
+        webServer.sendContent((const char *)rowBuf, (size_t)w * 2);
+      }
+      yield();
+    }
+    rgb332.close();
+    return;
+  }
   const uint16_t *const *arr = (slot == APP_CLAUDE) ? claude_sprite_frames : codex_sprite_frames;
   size_t frameBytes = (size_t)w * h * 2;
   webServer.setContentLength(1 + (size_t)frames * frameBytes);
@@ -1889,6 +2449,10 @@ void handleSpriteRaw(ActiveApp slot) {
 void handleSpriteReset(ActiveApp slot) {
   const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
   LittleFS.remove(binPath);
+  if (slot == APP_CODEX) {
+    LittleFS.remove(CODEX_PET_FILE);
+    LittleFS.remove(CODEX_PET_TEMP_FILE);
+  }
   spriteRev++;
   loadCustomSpriteState();
   if (slot == APP_CLAUDE) claudeFrame = 0;
@@ -1920,7 +2484,7 @@ void handleResetWifi() {
 struct GifDecodeCtx {
   int canvasW, canvasH; // GIF native size
   int targetW, targetH; // slot size we're rescaling down to
-  size_t rowBytes;      // targetW * 2
+  size_t rowBytes;      // targetW RGB332 bytes
   File out;             // output .bin, written sequentially
   File prevFile;        // previous frame in the .bin, read sequentially for compositing
   bool hasPrev;         // false for frame 0 (nothing to composite over -> black)
@@ -1961,14 +2525,14 @@ int32_t gifSeekCB(GIFFILE *pFile, int32_t iPosition) {
 // previous frame). Reads are sequential and stay aligned with producedRow.
 static void readPrevRow(GifDecodeCtx *ctx) {
   if (ctx->hasPrev)
-    ctx->prevFile.read((uint8_t *)prevRowBuf, ctx->rowBytes);
+    ctx->prevFile.read(prevSprite8Row, ctx->rowBytes);
   else
-    memset(prevRowBuf, 0, ctx->rowBytes);
+    memset(prevSprite8Row, 0, ctx->rowBytes);
 }
 
-// Appends the current rowBuf as the next output row.
+// Appends the current RGB332 row as the next output row.
 static void emitRow(GifDecodeCtx *ctx) {
-  ctx->out.write((const uint8_t *)rowBuf, ctx->rowBytes);
+  ctx->out.write(sprite8Row, ctx->rowBytes);
   ctx->producedRow++;
 }
 
@@ -1976,7 +2540,7 @@ static void emitRow(GifDecodeCtx *ctx) {
 // frame (top/bottom gaps of a partial frame).
 static void emitPrevRow(GifDecodeCtx *ctx) {
   readPrevRow(ctx);
-  memcpy(rowBuf, prevRowBuf, ctx->rowBytes);
+  memcpy(sprite8Row, prevSprite8Row, ctx->rowBytes);
   emitRow(ctx);
 }
 
@@ -2001,7 +2565,7 @@ void gifDrawCB(GIFDRAW *pDraw) {
 
     // srcRow == sy: composite this source line over the previous frame's row.
     readPrevRow(ctx);
-    memcpy(rowBuf, prevRowBuf, ctx->rowBytes);
+    memcpy(sprite8Row, prevSprite8Row, ctx->rowBytes);
     for (int tx = 0; tx < ctx->targetW; tx++) {
       int sx = (int)((long)tx * ctx->canvasW / ctx->targetW);
       int rel = sx - pDraw->iX;
@@ -2009,8 +2573,7 @@ void gifDrawCB(GIFDRAW *pDraw) {
       uint8_t idx = src[rel];
       if (hasTrans && idx == transIdx) continue;     // transparent: keep previous pixel
       uint8_t r = pal[idx * 3 + 0], g = pal[idx * 3 + 1], b = pal[idx * 3 + 2];
-      uint16_t val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-      rowBuf[tx] = (uint16_t)(((val & 0xFF) << 8) | (val >> 8)); // byte-swap to match convert_sprites.py
+      sprite8Row[tx] = (r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6);
     }
     emitRow(ctx);
   }
@@ -2036,9 +2599,9 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
   ctx.canvasH = gif->getCanvasHeight();
   ctx.targetW = targetW;
   ctx.targetH = targetH;
-  ctx.rowBytes = (size_t)targetW * 2;
+  ctx.rowBytes = (size_t)targetW;
   ctx.hasPrev = false;
-  size_t frameBytes = (size_t)targetW * targetH * 2;
+  size_t frameBytes = (size_t)targetW * targetH;
 
   ctx.out = LittleFS.open(binPath, "w");
   if (!ctx.out) {
@@ -2046,6 +2609,7 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
     delete gif;
     return false;
   }
+  ctx.out.write((const uint8_t *)"SP8", 3);
   ctx.out.write((uint8_t)0); // placeholder frame count, patched once we know the total
 
   uint8_t count = 0;
@@ -2057,7 +2621,7 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
       ctx.out.flush(); // make the just-written previous frame visible to the read handle
       ctx.prevFile = LittleFS.open(binPath, "r");
       ctx.hasPrev = (bool)ctx.prevFile;
-      if (ctx.hasPrev) ctx.prevFile.seek(1 + (size_t)(count - 1) * frameBytes);
+      if (ctx.hasPrev) ctx.prevFile.seek(4 + (size_t)(count - 1) * frameBytes);
     }
 
     more = gif->playFrame(false, &delayMs, &ctx);
@@ -2081,7 +2645,7 @@ bool decodeGifToBin(const char *gifPath, const char *binPath, int targetW, int t
   }
   File patch = LittleFS.open(binPath, "r+");
   if (patch) {
-    patch.seek(0);
+    patch.seek(3);
     patch.write(count);
     patch.close();
   }
@@ -2107,6 +2671,27 @@ void handleSpriteUploadChunk(const char *gifPath) {
   }
 }
 
+void handleCodexGifUploadChunk() {
+  if (webServer.upload().status == UPLOAD_FILE_START) {
+    LittleFS.remove(CODEX_PET_FILE);
+    codexPetCustom = false;
+  }
+  handleSpriteUploadChunk(CODEX_GIF_FILE);
+}
+
+void handleCodexPetUploadChunk() {
+  if (webServer.upload().status == UPLOAD_FILE_START) {
+    // A 2MB LittleFS cannot hold two 1.18MB pets at once. Replacement is
+    // intentionally fail-safe to the built-in pet rather than atomic.
+    LittleFS.remove(CODEX_PET_FILE);
+    LittleFS.remove(CODEX_SPRITE_FILE);
+    LittleFS.remove(CODEX_PET_TEMP_FILE);
+    codexPetCustom = false;
+    codexCustom = false;
+  }
+  handleSpriteUploadChunk(CODEX_PET_TEMP_FILE);
+}
+
 void handleSpriteUploadDone(ActiveApp slot) {
   const char *gifPath = (slot == APP_CLAUDE) ? CLAUDE_GIF_FILE : CODEX_GIF_FILE;
   const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
@@ -2115,6 +2700,7 @@ void handleSpriteUploadDone(ActiveApp slot) {
 
   bool ok = decodeGifToBin(gifPath, binPath, tw, th);
   LittleFS.remove(gifPath); // temp raw gif no longer needed once decoded
+  if (ok && slot == APP_CODEX) LittleFS.remove(CODEX_PET_FILE);
 
   spriteRev++;
   loadCustomSpriteState();
@@ -2131,6 +2717,30 @@ void handleSpriteUploadDone(ActiveApp slot) {
   }
 }
 
+void handleCodexPetUploadDone() {
+  if (uploadFile) uploadFile.close();
+  String error;
+  if (installCodexPetTemp(error)) webServer.send(200, "text/plain", "ok");
+  else webServer.send(400, "text/plain", error);
+}
+
+void handleApiPetState() {
+  PetState requested;
+  if (!parsePetState(webServer.arg("state"), requested)) {
+    webServer.send(400, "text/plain", "invalid pet state");
+    return;
+  }
+  int ttl = constrain(webServer.arg("ttl_ms").toInt(), 250, 600000);
+  if (ttl == 250 && webServer.arg("ttl_ms").length() == 0) ttl = 10000;
+  petStateOverride = requested;
+  petStateOverrideDeadlineMs = millis() + ttl;
+  codexPetState = requested;
+  codexFrame = 0;
+  spriteRev++;
+  if (currentApp == APP_CODEX) drawActiveApp();
+  webServer.send(200, "text/plain", "ok");
+}
+
 void setupWebServer() {
   webServer.on("/", HTTP_GET, handleRoot);
   webServer.on("/save", HTTP_POST, handleSave);
@@ -2139,6 +2749,7 @@ void setupWebServer() {
   webServer.on("/api/display", HTTP_POST, handleApiDisplay);
   webServer.on("/api/bridge", HTTP_POST, handleApiBridge);
   webServer.on("/api/brightness", HTTP_POST, handleApiBrightness);
+  webServer.on("/api/pet-state", HTTP_POST, handleApiPetState);
   webServer.on("/sprite/claude/reset", HTTP_POST, []() { handleSpriteReset(APP_CLAUDE); });
   webServer.on("/sprite/codex/reset", HTTP_POST, []() { handleSpriteReset(APP_CODEX); });
   webServer.on("/sprite/claude/raw", HTTP_GET, []() { handleSpriteRaw(APP_CLAUDE); });
@@ -2148,7 +2759,10 @@ void setupWebServer() {
       []() { handleSpriteUploadChunk(CLAUDE_GIF_FILE); });
   webServer.on(
       "/sprite/codex", HTTP_POST, []() { handleSpriteUploadDone(APP_CODEX); },
-      []() { handleSpriteUploadChunk(CODEX_GIF_FILE); });
+      handleCodexGifUploadChunk);
+  webServer.on(
+      "/pet/codex", HTTP_POST, handleCodexPetUploadDone,
+      handleCodexPetUploadChunk);
   webServer.begin();
   Serial.printf("[web] admin server listening on http://%s/\n", WiFi.localIP().toString().c_str());
 }
@@ -2158,9 +2772,13 @@ void setupWebServer() {
 void setup() {
   Serial.setRxBufferSize(2048); // a serial #STATUS frame (~600B) must survive a slow draw
   Serial.begin(115200);
-  LittleFS.begin();
+  if (!LittleFS.begin()) {
+    LittleFS.format(); // migrate the previous 1MB LittleFS partition to 2MB
+    LittleFS.begin();
+  }
   loadBridgeHost();
   loadBrightness();
+  loadDisplayMode();
   loadCustomSpriteState();
 
   tft.init();
@@ -2209,6 +2827,14 @@ void loop() {
 
   unsigned long nowMs = millis();
 
+  if (agentEvent != EVENT_NONE && !agentEventActive()) {
+    agentEvent = EVENT_NONE;
+    if (effectiveMode() != MODE_NET && effectiveMode() != MODE_MUSIC && effectiveMode() != MODE_STOCK) {
+      updateActiveApp();
+      drawActiveApp();
+    }
+  }
+
   // Effective mode may differ from the configured one (AUTO -> music while
   // audio plays). On a transition, reset the incoming mode's chrome so it
   // repaints cleanly, and repaint the pet immediately when returning to it.
@@ -2255,17 +2881,28 @@ void loop() {
     }
     if (!stockChromeDrawn || stockDirty) drawStockScreen();
   } else {
+    if (codexPetCustom) {
+      PetState desiredState = desiredCodexPetState();
+      if (desiredState != codexPetState) {
+        codexPetState = desiredState;
+        codexFrame = 0;
+        spriteRev++;
+        if (currentApp == APP_CODEX && showingCd == CD_NONE) drawCodexSprite(0);
+      }
+    }
     // sprite walk-cycle animation (only advances while that app is showing)
-    if (nowMs - lastAnimMs >= ANIM_INTERVAL_MS) {
+    unsigned long animInterval = (currentApp == APP_CODEX && codexPetCustom)
+        ? codexPetStates[codexPetState].delayMs : ANIM_INTERVAL_MS;
+    if (nowMs - lastAnimMs >= animInterval) {
       lastAnimMs = nowMs;
       bool claudeWorking = claudeStatus.status == "working";
-      bool codexWorking = codexStatus.status == "working";
+      bool codexWorking = codexStatus.status == "working" || (agentEventActive() && agentEvent == EVENT_TOOL_RUNNING);
       if (showingCd != CD_NONE) {
         // countdown owns the center area: no sprite frames over it
       } else if (currentApp == APP_CLAUDE && claudeWorking) {
         claudeFrame = (claudeFrame + 1) % claudeFrameCount();
         drawClaudeSprite(claudeFrame);
-      } else if (currentApp == APP_CODEX && codexWorking) {
+      } else if (currentApp == APP_CODEX && (codexWorking || codexPetCustom)) {
         codexFrame = (codexFrame + 1) % codexFrameCount();
         drawCodexSprite(codexFrame);
       }
@@ -2282,13 +2919,13 @@ void loop() {
     if (nowMs - lastFlashMs >= FLASH_INTERVAL_MS) {
       lastFlashMs = nowMs;
       flashOn = !flashOn;
-      if (bridgeStale()) {
-        redrawRingOnly();
-      } else if (currentAppNeedsInput()) {
+      if (currentAppNeedsInput()) {
         // approval needed: blink the whole border red, restore the quota ring
-        // on the off-phase so it doesn't erase the normal chrome permanently
+        // on the off-phase so it doesn't erase the normal chrome permanently.
         if (flashOn) drawFullBorder(TFT_RED);
         else redrawRingOnly();
+      } else if (currentStatusFlashes()) {
+        redrawRingOnly();
       }
     }
 

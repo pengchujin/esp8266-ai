@@ -35,6 +35,8 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--test-pet" {
 
 let port: UInt16 = 8765
 let service = StatusService()
+service.refresh()
+Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in service.refresh() }
 let usage = UsageFetcher()
 service.usage = usage
 let netMonitor = NetSpeedMonitor()
@@ -70,7 +72,9 @@ let server = HTTPServer(port: port, routes: [
     "/event": { body in
         if let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
            let agent = obj["agent"] as? String, let event = obj["event"] as? String {
-            service.recordEvent(agent: agent, event: event, message: obj["message"] as? String)
+            let sessionID = obj["session_id"] as? String ?? obj["conversation_id"] as? String
+            service.recordEvent(agent: agent, event: event, message: obj["message"] as? String,
+                                sessionID: sessionID)
             return Data("{\"ok\":true}".utf8)
         }
         return Data("{\"ok\":false}".utf8)

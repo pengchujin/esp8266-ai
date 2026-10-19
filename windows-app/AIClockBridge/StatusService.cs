@@ -33,6 +33,26 @@ class CodexStatus
     public int? WeeklyWindowMin;
     public int? WeeklyResetMin;
     public bool NeedsInput;
+    public string PetState = "idle";
+    public int ActiveTasks;
+    internal HashSet<string> ActiveExecutionIds = new();
+    internal Dictionary<string, double> ActiveExecutionAt = new();
+    internal Dictionary<string, string> ExecutionSessionIds = new();
+    internal Dictionary<string, double> CompletedSessionAt = new();
+    internal Dictionary<string, double> WaitingExecutionAt = new();
+    internal Dictionary<string, double> InputResolvedSessionAt = new();
+
+    public CodexStatus Clone()
+    {
+        var clone = (CodexStatus)this.MemberwiseCloneOf();
+        clone.ActiveExecutionIds = new(ActiveExecutionIds);
+        clone.ActiveExecutionAt = new(ActiveExecutionAt);
+        clone.ExecutionSessionIds = new(ExecutionSessionIds);
+        clone.CompletedSessionAt = new(CompletedSessionAt);
+        clone.WaitingExecutionAt = new(WaitingExecutionAt);
+        clone.InputResolvedSessionAt = new(InputResolvedSessionAt);
+        return clone;
+    }
 }
 
 class StatusSnapshot
@@ -72,6 +92,8 @@ class StatusSnapshot
             WriteNullable(w, "weekly_window_min", Codex.WeeklyWindowMin);
             WriteNullable(w, "weekly_reset_min", Codex.WeeklyResetMin);
             w.WriteBoolean("needs_input", Codex.NeedsInput);
+            w.WriteString("pet_state", Codex.PetState);
+            w.WriteNumber("active_tasks", Codex.ActiveTasks);
             w.WriteEndObject();
             w.WriteEndObject();
         }
@@ -102,7 +124,7 @@ class StatusSnapshot
         return new StatusSnapshot
         {
             Claude = (ClaudeStatus)Claude.MemberwiseCloneOf(),
-            Codex = (CodexStatus)Codex.MemberwiseCloneOf(),
+            Codex = Codex.Clone(),
             Ts = Ts,
             MusicPlaying = MusicPlaying,
         };
@@ -145,12 +167,12 @@ sealed class StatusService
     record AgentEvent(string State, double At);
 
     AgentEvent _claudeEvent;
-    AgentEvent _codexEvent;
+    readonly Dictionary<string, AgentEvent> _codexEvents = new();
     // "needs input": a permission/approval prompt is on screen, waiting on the
     // user. Set by an attention event, cleared by the next concrete lifecycle
     // event (the prompt got answered) or by TTL.
     double? _claudeNeedsInputAt;
-    double? _codexNeedsInputAt;
+    readonly Dictionary<string, double> _codexNeedsInputAt = new();
     const double WorkingEventTTL = 10 * 60;
     const double IdleEventTTL = 60;
     const double NeedsInputTTL = 5 * 60;
@@ -165,7 +187,7 @@ sealed class StatusService
     // prompt. Claude's Notification is broader — it also fires on task
     // completion / 60s-idle — so it only counts as needs-input when its
     // message is actually a permission request.
-    static readonly HashSet<string> AttentionEvents = new() { "Elicitation", "PermissionRequest" };
+    static readonly HashSet<string> AttentionEvents = new() { "Elicitation", "PermissionRequest", "InputRequest" };
 
     static bool IsPermissionNotification(string message)
     {
@@ -175,11 +197,12 @@ sealed class StatusService
 
     /// Called by the /event endpoint. Unknown event names are ignored.
     /// `message` is only sent for Claude's Notification hook.
-    public void RecordEvent(string agent, string ev, string message = null)
+    public void RecordEvent(string agent, string ev, string message = null, string sessionId = null)
     {
         lock (_lock)
         {
             var now = Now();
+            var sessionKey = string.IsNullOrEmpty(sessionId) ? "__legacy__" : sessionId;
             // Claude Notification: flash only for permission prompts, not for
             // "task done / waiting for your input" notifications.
             if (ev == "Notification")
@@ -187,14 +210,18 @@ sealed class StatusService
                 if (IsPermissionNotification(message))
                 {
                     if (agent == "claude") _claudeNeedsInputAt = now;
-                    else if (agent == "codex") _codexNeedsInputAt = now;
+                    else if (agent == "codex") _codexNeedsInputAt[sessionKey] = now;
                 }
                 return;
             }
             if (AttentionEvents.Contains(ev))
             {
                 if (agent == "claude") _claudeNeedsInputAt = now;
-                else if (agent == "codex") _codexNeedsInputAt = now;
+                // PermissionRequest is emitted after PreToolUse even when the
+                // command was already approved and is about to execute. With
+                // no matching "approved" hook it cannot represent waiting.
+                else if (agent == "codex" && ev != "PermissionRequest")
+                    _codexNeedsInputAt[sessionKey] = now;
                 return;
             }
             string state;
@@ -204,7 +231,11 @@ sealed class StatusService
             var e = new AgentEvent(state, now);
             // any concrete lifecycle event means the prompt (if any) was answered
             if (agent == "claude") { _claudeEvent = e; _claudeNeedsInputAt = null; }
-            else if (agent == "codex") { _codexEvent = e; _codexNeedsInputAt = null; }
+            else if (agent == "codex")
+            {
+                _codexEvents[sessionKey] = e;
+                _codexNeedsInputAt.Remove(sessionKey);
+            }
         }
     }
 
@@ -222,9 +253,71 @@ sealed class StatusService
         return logStatus;
     }
 
+    void MergeCodexEvents(CodexStatus status, double now)
+    {
+        foreach (var key in _codexEvents.Where(x => now - x.Value.At >= WorkingEventTTL)
+                     .Select(x => x.Key).ToArray())
+            _codexEvents.Remove(key);
+        foreach (var key in _codexNeedsInputAt.Where(x => now - x.Value >= NeedsInputTTL)
+                     .Select(x => x.Key).ToArray())
+            _codexNeedsInputAt.Remove(key);
+        foreach (var (session, resolvedAt) in status.InputResolvedSessionAt)
+            if (_codexNeedsInputAt.TryGetValue(session, out var requestedAt) && resolvedAt >= requestedAt)
+                _codexNeedsInputAt.Remove(session);
+
+        var knownSessions = status.ExecutionSessionIds.Values.ToHashSet();
+        var active = new HashSet<string>(status.ActiveExecutionIds);
+        var latestWorkingAt = active.Select(id => status.ActiveExecutionAt.GetValueOrDefault(id)).DefaultIfEmpty().Max();
+        var legacyWorking = false;
+        var hasFreshIdle = false;
+        foreach (var (session, ev) in _codexEvents)
+        {
+            var ttl = ev.State == "working" ? WorkingEventTTL : IdleEventTTL;
+            if (now - ev.At >= ttl) continue;
+            if (ev.State == "working")
+            {
+                // Never let a delayed tool/subagent hook resurrect a session
+                // whose latest rollout lifecycle is already complete. A real
+                // next turn clears the marker through its task_started event.
+                if (status.CompletedSessionAt.ContainsKey(session)) continue;
+                if (session == "__legacy__" && knownSessions.Count == 0) legacyWorking = true;
+                else if (knownSessions.Contains(session)
+                         && !active.Any(id => status.ExecutionSessionIds.GetValueOrDefault(id) == session))
+                {
+                    var id = $"hook:{session}";
+                    active.Add(id);
+                    status.ExecutionSessionIds[id] = session;
+                }
+                latestWorkingAt = Math.Max(latestWorkingAt, ev.At);
+            }
+            else
+            {
+                hasFreshIdle = true;
+                active.RemoveWhere(id => status.ExecutionSessionIds.GetValueOrDefault(id) == session);
+            }
+        }
+        foreach (var session in _codexNeedsInputAt.Keys)
+            active.RemoveWhere(id => status.ExecutionSessionIds.GetValueOrDefault(id) == session);
+
+        status.ActiveExecutionIds = active;
+        status.ActiveTasks = active.Count + (legacyWorking ? 1 : 0);
+        var latestWaitingAt = Math.Max(_codexNeedsInputAt.Values.DefaultIfEmpty().Max(),
+                                       status.WaitingExecutionAt.Values.DefaultIfEmpty().Max());
+        var hasWaiting = latestWaitingAt > latestWorkingAt;
+        if (status.ActiveTasks > 0) status.Status = "working";
+        else if (hasFreshIdle && status.Status == "working") status.Status = "idle";
+        status.NeedsInput = hasWaiting;
+        if (status.NeedsInput)
+        {
+            status.Status = "waiting";
+            status.PetState = "waiting";
+        }
+        else status.PetState = status.Status == "working" ? "running" : "idle";
+    }
+
     const double WorkingThreshold = 20;        // log touched within this -> "working"
     const double IdleThreshold = 30 * 60;      // within this -> "idle", else "offline"
-    const double CacheTTL = 5;
+    const double CacheTTL = 1;
 
     readonly object _lock = new();
     StatusSnapshot _cached;
@@ -272,9 +365,8 @@ sealed class StatusService
                 }
             }
             snap.Claude.Status = OverrideStatus(snap.Claude.Status, _claudeEvent, now);
-            snap.Codex.Status = OverrideStatus(snap.Codex.Status, _codexEvent, now);
             snap.Claude.NeedsInput = NeedsInput(_claudeNeedsInputAt, now);
-            snap.Codex.NeedsInput = NeedsInput(_codexNeedsInputAt, now);
+            MergeCodexEvents(snap.Codex, now);
             snap.MusicPlaying = MusicPlayingProvider?.Invoke() ?? false;
             return snap;
         }
@@ -314,6 +406,66 @@ sealed class StatusService
         {
             return null;
         }
+    }
+
+    static string[] ReadTailLines(string path, int maxBytes = 131_072)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                                          FileShare.ReadWrite | FileShare.Delete);
+            fs.Seek(Math.Max(0, fs.Length - maxBytes), SeekOrigin.Begin);
+            using var reader = new StreamReader(fs, Encoding.UTF8);
+            return reader.ReadToEnd().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        }
+        catch { return null; }
+    }
+
+    record RolloutInfo(string ExecutionId, string SessionId, bool IsGuardian);
+
+    static RolloutInfo ReadRolloutInfo(string path, string fallbackId, int maxBytes = 262_144)
+    {
+        var fallback = new RolloutInfo(fallbackId, fallbackId, false);
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                                          FileShare.ReadWrite | FileShare.Delete);
+            var bytes = new byte[Math.Min(maxBytes, (int)Math.Min(fs.Length, int.MaxValue))];
+            var count = fs.Read(bytes, 0, bytes.Length);
+            foreach (var line in Encoding.UTF8.GetString(bytes, 0, count)
+                         .Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (!line.Contains("\"session_meta\"")) continue;
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (StringVal(root, "type") != "session_meta" || !TryProp(root, "payload", out var payload))
+                    continue;
+                var executionId = StringVal(payload, "id") ?? fallbackId;
+                var sessionId = StringVal(payload, "session_id") ?? executionId;
+                var guardian = TryProp(payload, "source", out var source)
+                    && TryProp(source, "subagent", out var subagent)
+                    && StringVal(subagent, "other") == "guardian";
+                return new RolloutInfo(executionId, sessionId, guardian);
+            }
+        }
+        catch { }
+        return fallback;
+    }
+
+    static bool MessageRequestsUserInput(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message)) return false;
+        var tail = message.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(x => x.Trim()).Where(x => x.Length > 0 && !x.StartsWith("```"))
+            .TakeLast(6)
+            .Select(x => string.Join(' ', x.Split(' ').Where(word => !word.Contains("://"))));
+        var text = string.Join('\n', tail);
+        if (text.Contains('?') || text.Contains('？')) return true;
+        var lower = text.ToLowerInvariant();
+        string[] cues = { "请告诉我", "请提供", "请选择", "请确认", "请回答", "需要你提供", "回复我",
+            "let me know", "please provide", "please choose", "please confirm", "which option",
+            "what would you", "could you" };
+        return cues.Any(lower.Contains);
     }
 
     static int IntVal(JsonElement obj, string key)
@@ -421,7 +573,7 @@ sealed class StatusService
         var now = Now();
         double lastMtime = 0;
 
-        // Whole-tree scan just for the freshest mtime (drives working/idle).
+        var recentFiles = new List<(string Path, double Mtime)>();
         if (Directory.Exists(_codexDir))
         {
             try
@@ -431,6 +583,7 @@ sealed class StatusService
                     var mtime = new DateTimeOffset(File.GetLastWriteTimeUtc(file), TimeSpan.Zero)
                         .ToUnixTimeMilliseconds() / 1000.0;
                     if (mtime > lastMtime) lastMtime = mtime;
+                    if (now - mtime < 7 * 24 * 60 * 60) recentFiles.Add((file, mtime));
                 }
             }
             catch
@@ -438,6 +591,111 @@ sealed class StatusService
                 // partial scan is fine
             }
         }
+
+        var activeExecutions = new HashSet<string>();
+        var activeExecutionAt = new Dictionary<string, double>();
+        var executionSessionIds = new Dictionary<string, string>();
+        var completedSessionAt = new Dictionary<string, double>();
+        var waitingExecutionAt = new Dictionary<string, double>();
+        var inputResolvedSessionAt = new Dictionary<string, double>();
+        var latestLifecycleTs = 0.0;
+        var sawLifecycle = false;
+        var latestLifecycle = new Dictionary<string,
+            (string SessionId, bool Active, bool AsksInput, bool ResolvesInput, double At, double Mtime)>();
+        var legacyActiveExecutions = new HashSet<string>();
+
+        foreach (var (file, fileMtime) in recentFiles)
+        {
+            var lines = ReadTailLines(file);
+            if (lines == null) continue;
+            var fileBase = Path.GetFileNameWithoutExtension(file);
+            var fallbackId = fileBase.Length >= 36 ? fileBase[^36..] : fileBase;
+            var rollout = ReadRolloutInfo(file, fallbackId);
+            if (rollout.IsGuardian) continue;
+            var executionId = rollout.ExecutionId;
+            var sessionId = rollout.SessionId;
+            executionSessionIds[executionId] = sessionId;
+            var fileSawLifecycle = false;
+            var pendingInputCalls = new HashSet<string>();
+            foreach (var line in lines)
+            {
+                if (!line.Contains("\"task_started\"") && !line.Contains("\"task_complete\"")
+                    && !line.Contains("\"turn_aborted\"") && !line.Contains("\"function_call\"")
+                    && !line.Contains("\"function_call_output\"")
+                    && !line.Contains("\"custom_tool_call_output\"")) continue;
+                JsonDocument doc;
+                try { doc = JsonDocument.Parse(line); } catch { continue; }
+                using (doc)
+                {
+                    var root = doc.RootElement;
+                    if (!TryProp(root, "payload", out var payload)) continue;
+                    var type = StringVal(payload, "type");
+                    var eventTs = ParseIso(StringVal(root, "timestamp")) ?? fileMtime;
+                    var previousAt = latestLifecycle.TryGetValue(executionId, out var previous)
+                        ? previous.At : 0;
+                    if (type == "function_call")
+                    {
+                        var name = StringVal(payload, "name")?.ToLowerInvariant() ?? "";
+                        if (!name.Contains("request_user_input") && !name.Contains("ask_user")) continue;
+                        var callId = StringVal(payload, "call_id");
+                        if (callId != null) pendingInputCalls.Add(callId);
+                        if (eventTs >= previousAt)
+                            latestLifecycle[executionId] = (sessionId, true, true, false, eventTs, fileMtime);
+                        continue;
+                    }
+                    if (type == "function_call_output" || type == "custom_tool_call_output")
+                    {
+                        var callId = StringVal(payload, "call_id");
+                        if (callId != null && pendingInputCalls.Remove(callId) && eventTs >= previousAt)
+                            latestLifecycle[executionId] = (sessionId, true, false, true, eventTs, fileMtime);
+                        continue;
+                    }
+                    if (type != "task_started" && type != "task_complete" && type != "turn_aborted")
+                        continue;
+                    var asksInput = type == "task_complete"
+                        && MessageRequestsUserInput(StringVal(payload, "last_agent_message"));
+                    var resolvesInput = latestLifecycle.TryGetValue(executionId, out previous)
+                        && previous.AsksInput && !asksInput;
+                    pendingInputCalls.Clear();
+                    fileSawLifecycle = true;
+                    sawLifecycle = true;
+                    latestLifecycleTs = Math.Max(latestLifecycleTs, eventTs);
+                    if (eventTs >= previousAt)
+                        latestLifecycle[executionId] = (sessionId, type == "task_started", asksInput,
+                                                        resolvesInput, eventTs, fileMtime);
+                }
+            }
+            if (!fileSawLifecycle && now - fileMtime < WorkingThreshold)
+            {
+                legacyActiveExecutions.Add(executionId);
+                activeExecutionAt[executionId] = fileMtime;
+            }
+        }
+
+        var sessionsWithRunnableWork = new HashSet<string>();
+        foreach (var (executionId, lifecycle) in latestLifecycle)
+        {
+            executionSessionIds[executionId] = lifecycle.SessionId;
+            if (lifecycle.ResolvesInput)
+                inputResolvedSessionAt[lifecycle.SessionId] = Math.Max(
+                    inputResolvedSessionAt.GetValueOrDefault(lifecycle.SessionId), lifecycle.At);
+            if (lifecycle.AsksInput) waitingExecutionAt[executionId] = lifecycle.At;
+            else if (lifecycle.Active
+                     && (now - lifecycle.At < WorkingEventTTL || now - lifecycle.Mtime < 2 * 60))
+            {
+                activeExecutions.Add(executionId);
+                activeExecutionAt[executionId] = Math.Max(lifecycle.At, lifecycle.Mtime);
+                sessionsWithRunnableWork.Add(lifecycle.SessionId);
+            }
+            else if (!lifecycle.Active)
+                completedSessionAt[lifecycle.SessionId] = Math.Max(
+                    completedSessionAt.GetValueOrDefault(lifecycle.SessionId), lifecycle.At);
+        }
+        activeExecutions.UnionWith(legacyActiveExecutions);
+        foreach (var executionId in legacyActiveExecutions)
+            if (executionSessionIds.TryGetValue(executionId, out var sessionId))
+                sessionsWithRunnableWork.Add(sessionId);
+        foreach (var sessionId in sessionsWithRunnableWork) completedSessionAt.Remove(sessionId);
 
         // Tokens + rate limits only from today's day directory.
         var today = DateTime.Today;
@@ -452,7 +710,7 @@ sealed class StatusService
         {
             foreach (var file in Directory.EnumerateFiles(dayDir, "*.jsonl"))
             {
-                var lines = ReadLines(file);
+                var lines = ReadTailLines(file);
                 if (lines == null) continue;
                 var sessionMaxTokens = 0;
                 foreach (var line in lines)
@@ -491,8 +749,24 @@ sealed class StatusService
             }
         }
 
-        var s = new CodexStatus { TokensToday = tokensToday };
-        s.Status = StatusFromDelta(lastMtime > 0 ? now - lastMtime : 1e9);
+        var s = new CodexStatus
+        {
+            TokensToday = tokensToday,
+            ActiveExecutionIds = activeExecutions,
+            ActiveExecutionAt = activeExecutionAt,
+            ExecutionSessionIds = executionSessionIds,
+            CompletedSessionAt = completedSessionAt,
+            WaitingExecutionAt = waitingExecutionAt,
+            InputResolvedSessionAt = inputResolvedSessionAt,
+            ActiveTasks = activeExecutions.Count,
+        };
+        if (sawLifecycle)
+        {
+            if (activeExecutions.Count > 0) s.Status = "working";
+            else if (now - latestLifecycleTs < IdleThreshold) s.Status = "idle";
+            else s.Status = "offline";
+        }
+        else s.Status = StatusFromDelta(lastMtime > 0 ? now - lastMtime : 1e9);
         if (latestRateLimits.HasValue)
         {
             // Same window-length classification as UsageFetcher.FetchCodex:

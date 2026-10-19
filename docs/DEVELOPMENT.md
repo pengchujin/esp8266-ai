@@ -180,19 +180,22 @@ pio device monitor -b 115200
 
 ## 4. 自定义桌宠形象
 
-两个入口，推荐 Mac 菜单栏（petdex 画廊 + 预览），设备网页作为兜底：
+自定义 Codex Pet 统一从 **USB 控制页 `http://127.0.0.1:8765/`** 接入。选择
+`~/.codex/pets/<id>/` 目录后，浏览器读取标准 `pet.json + spritesheet.webp`：支持
+1536x1872 的 v1（8x9）以及 1536x2288 的 v2（8x11）；ESP 使用其中前九种动作。
+图片只在本机转换，再由 `aiclock-usb` 分块写入设备，不依赖 WiFi，也不启动
+AIClockBridge 或修改 Codex 桌面端当前宠物设置。
 
-1. **Mac 菜单栏 →「更换桌宠动画…」**：从 [petdex.dev](https://petdex.dev) 的公开
-   manifest（`assets.petdex.dev/manifests/petdex-v1.json`，3300+ 开源桌宠）搜索选择。
-   每个桌宠是一张 1536x1872 的 WebP 精灵图（8 列 x 9 行，每帧 192x208，每行一种动画：
-   待机/左右跑/挥手/跳跃/失败/等待/原地跑/思考）。app 在本地裁出所选动画行、缩放到
-   目标插槽尺寸、合成黑底循环 GIF，然后 POST 到设备的 `/sprite/claude|codex`。
-2. **设备网页** `http://<设备IP>/`：手动上传任意 `.gif`，适合用自己的图。
+也可以用同一套 USB bridge CLI 安装，适合调试和自动化：
 
-两条路最终都走同一条链路：设备收到 GIF 后**自己在板上解码并缩放**，立刻替换该角色的
-动画，重启后也记得，**不需要重新编译或烧录固件**。
+```bash
+swift build -c release
+.build/release/aiclock-usb pet-install ~/.codex/pets/xi-jinping
+```
 
-### 设备 HTTP API（Mac app 用的就是这套）
+安装结果会持久化并立即生效，**不需要重新编译或烧录固件**。
+
+### 设备兼容 HTTP API
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -200,10 +203,30 @@ pio device monitor -b 115200
 | POST | `/api/display` | `mode=auto\|claude\|codex\|net\|music` 切换屏幕显示（net=网速曲线页，music=音乐播放页）|
 | POST | `/api/bridge` | `host=ip:port` 设置桥接地址 |
 | POST | `/sprite/claude`、`/sprite/codex` | multipart 上传 GIF 并板上解码替换 |
+| POST | `/pet/codex` | multipart 上传完整九状态 `AIPET1` Codex Pet |
+| POST | `/api/pet-state` | `state=<九状态>&ttl_ms=<时长>` 临时预览指定动作 |
 | POST | `/sprite/claude/reset`、`/sprite/codex/reset` | 删除自定义动画，恢复内置形象 |
 | GET | `/sprite/claude/raw`、`/sprite/codex/raw` | 当前生效动画的原始帧流 `[1B帧数][RGB565大端帧...]`（镜像窗口用）|
 
 `/api/info` 里的 `sprite_rev` 在每次上传/重置动画后自增，镜像端据此决定是否重新拉帧。
+
+USB 控制页本机 API：`POST /api/pet/codex` 接收固定 820,928 字节的 `AIPET1`，
+`POST /api/pet/reset` 恢复内置 Codex 宠物，`GET /api/status` 的 `usb.pet_upload`
+返回传输进度。bridge 与固件使用串口协议 v3：`#PET_BEGIN`、按序 `#PET_CHUNK`
+（每块最多 768 字节 Base64）和 `#PET_END`；每步必须收到同 id 的 `#ACK`。
+
+### 完整 Codex Pet 存储与状态
+
+浏览器将九行共 57 帧缩放到 120x120，并编码为带版本、偏移表、长度和 CRC32 的 `AIPET1`
+文件。像素使用 RGB332，每帧 14,400 字节，完整宠物约 821KB。固件逐行读取并即时展开为
+RGB565，因此无需整帧 RAM；原有自定义 GIF 也会存为 RGB332，旧 RGB565 文件在首次启动时
+自动迁移。这样完整 Codex Pet 与最多 8 帧的 Claude 自定义动画合计约 927KB，可放入现有
+约 1MB LittleFS，无需改变 4MB Flash 分区。
+
+状态映射为：空闲 `idle`、工作/思考 `running`、审批 `waiting`、审阅 `review`、失败
+`failed`、成功短暂 `jumping`。左右跑和挥手保留给导入预览与 `/api/pet-state`；固定屏幕
+不会自动让宠物横向漫游。完整宠物替换时，由于 LittleFS 无法同时保存两份 821KB 文件，
+设备会先释放旧宠物；上传或 CRC 校验失败时安全回退到固件内置形象。
 
 ## 5. 网速曲线页（Mac + 设备同步显示）
 
@@ -257,10 +280,32 @@ Mac 端常驻进程由 LaunchAgent（`~/Library/LaunchAgents/local.AIClockBridge
   不会拖慢 Claude Code；与已有 hooks 共存，靠命令里的 `8765/event` 标记幂等）
 - 映射：UserPromptSubmit/Pre/PostToolUse 等 → working（TTL 10 分钟，覆盖长工具调用）；
   Stop/Notification 等 → idle（TTL 60 秒，只用来立刻压掉 mtime 的"工作尾巴"）
-- Codex 侧已写入 `~/.codex/hooks.json` + `config.toml [features] hooks = true`，
-  但 Codex 要求在 TUI 里跑一次 `/hooks` 信任新命令后才生效；未信任前走 mtime 兜底。
-- 局限：事件是全局的不分会话——A 会话 Stop 会把还在干活的 B 会话压成 idle 最多 60 秒
-  （B 的下一个工具调用事件会立刻翻回 working）。
+- Codex 侧使用当前桌面版读取的 `~/.codex/hooks.json`（仓库模板为
+  `tools/codex-aiclock-hooks.json`）；`hooks` 功能在当前版本中默认启用。
+  新命令需要在桌面端「Settings → Hooks」中信任后生效；未信任前走 JSONL 兜底。
+- Hook 会携带 session id，bridge 按会话聚合状态：A 会话 Stop 不会再覆盖仍在运行的 B 会话。
+  未触发 Hook 时，bridge 从 Codex JSONL 的 `task_started` / `task_complete` 配对判断活跃任务；
+  只有旧格式日志才回退到文件 mtime。
+- Codex 的 `PermissionRequest` 会出现在 `PreToolUse` 之后、实际命令执行之前，而且没有对应的
+  “批准完成”事件，因此不能直接映射为 waiting；真正的提问由 `request_user_input` 的
+  `InputRequest` + JSONL `function_call_output` 配对维护。多 Agent 按 rollout execution id 计数，
+  同一任务里的子 Agent 完成不会覆盖仍在运行的父任务或兄弟 Agent。
+
+### 7.1 OpenPet Agent Event（USB 时钟）
+
+USB CLI 额外兼容 OpenPet 的本机事件入口：`POST /api/event`（`/event` 也兼容），body 为
+`{"type":"thinking|tool-running|reviewing|success|failure|attention","ttlMs":4000}`。事件直接经 USB
+确认后显示在 Codex 页顶部；显式 API 事件按 `ttlMs` 自动恢复，Codex 的 working 状态则保留至
+下一个生命周期事件（最长 10 分钟，防止异常退出后卡住）。当前用户级 Codex Hook 自动映射为：
+
+- `UserPromptSubmit` → `thinking`
+- `PreToolUse` → `tool-running`
+- `PostToolUse` / 子 Agent / 上下文压缩 → 保持 `working`
+- `Stop` → `success`
+
+`reviewing`、`failure` 应由调用方显式发出；Codex 的 `PostToolUse` 每个工具结束都会触发，不能据此
+判断进入正式 review 阶段。
+仓库内 `tools/codex-aiclock-event.sh` 仅向 `127.0.0.1:8765` 发事件名，不读取或发送提示词/工具参数。
 
 ### GIF 上传架构
 

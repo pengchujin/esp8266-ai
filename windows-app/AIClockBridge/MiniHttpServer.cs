@@ -142,7 +142,14 @@ sealed class MiniHttpServer
 
         byte[] body;
         string statusLine, contentType;
-        if (method == "POST" && _postRoutes.TryGetValue(clean, out var postHandler))
+        var isLoopback = IPAddress.TryParse(ip, out var remoteAddress) && IPAddress.IsLoopback(remoteAddress);
+        if (method == "POST" && clean == "/event" && !isLoopback)
+        {
+            body = Encoding.UTF8.GetBytes("forbidden");
+            statusLine = "403 Forbidden";
+            contentType = "text/plain";
+        }
+        else if (method == "POST" && _postRoutes.TryGetValue(clean, out var postHandler))
         {
             body = postHandler(requestBody);
             statusLine = "200 OK";

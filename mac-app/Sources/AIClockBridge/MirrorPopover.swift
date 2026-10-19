@@ -711,6 +711,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     private var flashCounter = 0
+    private var petAnimElapsedMs = 0
 
     private func animTick() {
         guard let info = lastInfo, !mirror.netMode else { return }
@@ -732,10 +733,17 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         let snap = service.snapshot()
         let working = info.showing == "codex"
             ? snap.codex.status == "working" : snap.claude.status == "working"
-        if working {
+        if info.showing == "codex", info.codexCustomPet {
+            petAnimElapsedMs += 120
+            if petAnimElapsedMs >= info.petDelayMs {
+                petAnimElapsedMs = 0
+                mirror.frameIdx = (mirror.frameIdx + 1) % mirror.frames.count
+            }
+        } else if working {
             mirror.frameIdx = (mirror.frameIdx + 1) % mirror.frames.count
         } else if mirror.frameIdx != 0 {
             mirror.frameIdx = 0
+            petAnimElapsedMs = 0
         }
         mirror.needsDisplay = true
     }

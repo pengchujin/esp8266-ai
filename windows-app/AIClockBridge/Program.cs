@@ -68,7 +68,14 @@ static class Program
                             if (root.TryGetProperty("message", out var msg)
                                 && msg.ValueKind == JsonValueKind.String)
                                 message = msg.GetString();
-                            service.RecordEvent(agent.GetString(), ev.GetString(), message);
+                            string sessionId = null;
+                            if (root.TryGetProperty("session_id", out var sid)
+                                && sid.ValueKind == JsonValueKind.String)
+                                sessionId = sid.GetString();
+                            else if (root.TryGetProperty("conversation_id", out var cid)
+                                     && cid.ValueKind == JsonValueKind.String)
+                                sessionId = cid.GetString();
+                            service.RecordEvent(agent.GetString(), ev.GetString(), message, sessionId);
                             return Encoding.UTF8.GetBytes("{\"ok\":true}");
                         }
                     }
